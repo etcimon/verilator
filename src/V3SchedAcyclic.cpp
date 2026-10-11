@@ -45,6 +45,7 @@
 #include "V3SplitVar.h"
 #include "V3Stats.h"
 
+#include <algorithm>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -345,6 +346,56 @@ void reportCycles(Graph* graphp, const std::vector<VarVertex*>& cutVertices) {
     }
 }
 
+// Bit range of a cut variable read by a piece of logic. m_width == 0 means the whole variable.
+struct BitRange final {
+    int m_lsb;
+    int m_width;
+};
+
+// The constant bit ranges through which 'logicp' reads the cut variable 'vscp', coalesced.
+// Returns a single whole-variable range when any read is not a constant part select (whole
+// variable, variable index, unpacked array), or when the variable is narrow enough that
+// the precision would not pay for the extra sensitivity items.
+std::vector<BitRange> readRanges(AstNode* logicp, AstVarScope* vscp) {
+    std::vector<BitRange> whole{BitRange{0, 0}};
+    AstVar* const varp = vscp->varp();
+    AstNodeDType* const dtypep = varp->dtypep()->skipRefp();
+    if (VN_IS(dtypep, UnpackArrayDType)) return whole;
+    const int varWidth = varp->width();
+    if (varWidth <= VL_QUADSIZE) return whole;
+    std::vector<BitRange> ranges;
+    bool allConst = true;
+    logicp->foreach([&](AstVarRef* refp) {
+        if (!allConst) return;
+        if (refp->varScopep() != vscp) return;
+        if (!refp->access().isReadOrRW()) return;
+        AstSel* const selp = VN_CAST(refp->backp(), Sel);
+        if (!selp || selp->fromp() != refp || !VN_IS(selp->lsbp(), Const)) {
+            allConst = false;
+            return;
+        }
+        ranges.push_back(BitRange{selp->lsbConst(), selp->widthConst()});
+    });
+    if (!allConst || ranges.empty()) return whole;
+    // Coalesce overlapping / adjacent ranges
+    std::sort(ranges.begin(), ranges.end(),
+              [](const BitRange& a, const BitRange& b) { return a.m_lsb < b.m_lsb; });
+    std::vector<BitRange> merged;
+    for (const BitRange& r : ranges) {
+        if (!merged.empty() && r.m_lsb <= merged.back().m_lsb + merged.back().m_width) {
+            const int end = std::max(merged.back().m_lsb + merged.back().m_width, r.m_lsb + r.m_width);
+            merged.back().m_width = end - merged.back().m_lsb;
+        } else {
+            merged.push_back(r);
+        }
+    }
+    // Reading (nearly) all of it: keep the single whole-variable item
+    int covered = 0;
+    for (const BitRange& r : merged) covered += r.m_width;
+    if (covered * 2 >= varWidth) return whole;
+    return merged;
+}
+
 LogicByScope fixCuts(AstNetlist* netlistp, const std::vector<VarVertex*>& cutVertices) {
     // For all logic that reads a cut vertex, build a map from logic -> list of cut AstVarScope
     // they read. Also build a vector of the involved logic for deterministic results.
@@ -372,9 +423,17 @@ LogicByScope fixCuts(AstNetlist* netlistp, const std::vector<VarVertex*>& cutVer
         // Build the hybrid sensitivity list
         AstSenItem* senItemsp = nullptr;
         for (AstVarScope* const vscp : lvtx2Cuts[lvtxp]) {
-            AstVarRef* const refp = new AstVarRef{flp, vscp, VAccess::READ};
-            AstSenItem* const nextp = new AstSenItem{flp, VEdgeType::ET_HYBRID, refp};
-            senItemsp = AstNode::addNext(senItemsp, nextp);
+            for (const BitRange& range : readRanges(logicp, vscp)) {
+                AstVarRef* const refp = new AstVarRef{flp, vscp, VAccess::READ};
+                AstNodeExpr* sensp = refp;
+                if (range.m_width > 0) {
+                    // Only the bits this logic reads: a change elsewhere in the (possibly
+                    // very wide) cut variable cannot affect it
+                    sensp = new AstSel{flp, refp, range.m_lsb, range.m_width};
+                }
+                AstSenItem* const nextp = new AstSenItem{flp, VEdgeType::ET_HYBRID, sensp};
+                senItemsp = AstNode::addNext(senItemsp, nextp);
+            }
         }
         AstSenTree* const senTree = new AstSenTree{flp, senItemsp};
         // Add logic to result with new sensitivity

@@ -38,6 +38,8 @@ class SenExprBuilder final {
 
     std::unordered_map<VNRef<AstNode>, AstVarScope*> m_prev;  // The 'previous value' signals
     std::unordered_map<VNRef<AstNode>, AstVarScope*> m_curr;  // The 'current value' signals
+    std::unordered_map<VNRef<AstNode>, AstVarScope*> m_changed;  // The 'value changed' flags of
+                                                                 // wide change-detected signals
     std::unordered_set<VNRef<AstNode>> m_hasPreUpdate;  // Whether the given sen expression already
                                                         // has an update statement in m_preUpdates
     std::unordered_set<VNRef<AstNode>> m_hasPostUpdate;  // Likewise for m_postUpdates
@@ -45,6 +47,15 @@ class SenExprBuilder final {
     V3UniqueNames m_currNames{"__Vtrigcurrexpr"};  // For generating unique current value
                                                    // signal names
     V3UniqueNames m_prevNames{"__Vtrigprevexpr"};  // Likewise for previous values
+    V3UniqueNames m_chgNames{"__Vtrigchgexpr"};  // Likewise for 'changed' flags
+
+    // Wide packed signals under change detection: compare once into a flag, and copy
+    // the previous value only when the flag is set. The unconditional copy was a full
+    // copy of the signal (hundreds of words for struct arrays) on every trigger
+    // evaluation, of which there are several per clock.
+    static bool useChangedFlag(const AstNodeExpr* exprp) {
+        return exprp->isWide() && !VN_IS(exprp->dtypep()->skipRefp(), UnpackArrayDType);
+    }
 
     static bool isSupportedDType(AstNodeDType* dtypep) {
         dtypep = dtypep->skipRefp();
@@ -142,12 +153,52 @@ class SenExprBuilder final {
                 AstCMethodHard* const cmhp = new AstCMethodHard{flp, wrPrev(), "assign", rdCurr()};
                 cmhp->dtypeSetVoid();
                 m_postUpdates.push_back(cmhp->makeStmt());
+            } else if (useChangedFlag(exprp)) {
+                // Copy only when the value changed (the flag is computed in the pre updates)
+                AstVarScope* const chgp = getChanged(exprp, prevp);
+                AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, chgp, VAccess::READ}};
+                ifp->addThensp(new AstAssign{flp, wrPrev(), rdCurr()});
+                m_postUpdates.push_back(ifp);
             } else {
                 m_postUpdates.push_back(new AstAssign{flp, wrPrev(), rdCurr()});
             }
         }
 
         return prevp;
+    }
+    // The 'changed' flag of a wide change-detected expression, assigned 'curr != prev' in
+    // the pre updates (before any trigger is computed and before any previous value is
+    // updated). One builder serves every trigger function ('stl', 'act', 'nba', ...), so
+    // the flag is a module-level temporary at the top scope (like the 'previous value'
+    // variables) and EVERY trigger function that uses it recomputes it in its own pre
+    // updates -- the per-round m_hasPreUpdate set (cleared by getAndClearPreUpdates)
+    // tracks that, exactly as for the 'current value' temporaries.
+    AstVarScope* getChanged(AstNodeExpr* exprp, AstVarScope* prevp) {
+        FileLine* const flp = exprp->fileline();
+        auto it = m_changed.find(*exprp);
+        if (it == m_changed.end()) {
+            AstVarScope* chgp;
+            if (m_scopep->isTop()) {
+                chgp = m_scopep->createTemp(m_chgNames.get(exprp), 1);
+            } else {
+                AstVar* const varp = new AstVar{flp, VVarType::BLOCKTEMP,
+                                                m_chgNames.get(exprp), VFlagBitPacked{}, 1};
+                varp->funcLocal(true);
+                m_locals.push_back(varp);
+                chgp = new AstVarScope{flp, m_scopep, varp};
+                m_scopep->addVarsp(chgp);
+            }
+            it = m_changed.emplace(*exprp, chgp).first;
+        }
+        AstVarScope* const chgp = it->second;
+        // Add the compare to this round's pre updates if not there yet
+        if (m_hasPreUpdate.emplace(*chgp).second) {
+            AstNeq* const neqp
+                = new AstNeq{flp, getCurr(exprp), new AstVarRef{flp, prevp, VAccess::READ}};
+            m_preUpdates.push_back(
+                new AstAssign{flp, new AstVarRef{flp, chgp, VAccess::WRITE}, neqp});
+        }
+        return chgp;
     }
 
     std::pair<AstNodeExpr*, bool> createTerm(AstSenItem* senItemp) {
@@ -168,6 +219,12 @@ class SenExprBuilder final {
                 AstCMethodHard* const resultp = new AstCMethodHard{flp, currp(), "neq", prevp()};
                 resultp->dtypeSetBit();
                 return {resultp, true};
+            }
+            if (useChangedFlag(senp)) {
+                // One compare per evaluation, shared with the conditional previous-value copy
+                AstVarScope* const prevVscp = getPrev(senp);
+                AstVarScope* const chgp = getChanged(senp, prevVscp);
+                return {new AstVarRef{flp, chgp, VAccess::READ}, true};
             }
             return {new AstNeq{flp, currp(), prevp()}, true};
         case VEdgeType::ET_BOTHEDGE:  //
