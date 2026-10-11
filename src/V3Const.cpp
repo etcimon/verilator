@@ -1998,6 +1998,13 @@ private:
         if (!varNotReferenced(nextp->rhsp(), varref2p->varp())) return false;
         // If a variable is marked split_var, access to the variable should not be merged.
         if (varref1p->varp()->attrSplitVar() || varref2p->varp()->attrSplitVar()) return false;
+        // Never merge into a wide select: the separate part-select assignments
+        // expand (V3Expand ASSIGNSEL(const,wide)) into stores of only the words
+        // they touch, whereas a wide ASSIGN(SEL, CONCAT) becomes a chain of
+        // wide temporaries and VL_CONCAT_W* calls that each copy the whole
+        // vector (quadratic in the number of parts). Narrow merges still pay:
+        // the bits combine into one word operation.
+        if (sel1p->width() + sel2p->width() > VL_QUADSIZE) return false;
         // Swap?
         if ((con1p->toSInt() != con2p->toSInt() + sel2p->width())
             && (con2p->toSInt() != con1p->toSInt() + sel1p->width())) {
