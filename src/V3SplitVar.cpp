@@ -859,6 +859,27 @@ public:
     }
 };
 
+// A read of one element of a packed array-like variable with a run-time index:
+// SEL(var, idx * elemWidth, elemWidth). Instead of refusing to split the variable,
+// the split forces element boundaries and the read becomes a mux over the elements.
+class PackedVarDynRef final {
+    AstSel* const m_selp;  // The select to replace
+    AstNodeExpr* const m_idxp;  // Element index expression (owned by m_selp's tree)
+    const int m_elemWidth;
+    const int m_nElem;
+
+public:
+    PackedVarDynRef(AstSel* selp, AstNodeExpr* idxp, int elemWidth, int nElem)
+        : m_selp{selp}
+        , m_idxp{idxp}
+        , m_elemWidth{elemWidth}
+        , m_nElem{nElem} {}
+    AstSel* selp() const { return m_selp; }
+    AstNodeExpr* idxp() const { return m_idxp; }
+    int elemWidth() const { return m_elemWidth; }
+    int nElem() const { return m_nElem; }
+};
+
 // How a variable is used
 class PackedVarRef final {
     struct SortByFirst {
@@ -868,6 +889,7 @@ class PackedVarRef final {
         }
     };
     std::vector<PackedVarRefEntry> m_lhs, m_rhs;
+    std::vector<PackedVarDynRef> m_dyn;  // Element reads with run-time index
     AstBasicDType* const m_basicp;  // Cache the ptr since varp->dtypep()->basicp() is expensive
     bool m_dedupDone = false;
     static void dedupRefs(std::vector<PackedVarRefEntry>& refs) {
@@ -898,6 +920,11 @@ public:
         if (access.isWriteOrRW()) m_lhs.push_back(e);
         if (access.isReadOrRW()) m_rhs.push_back(e);
     }
+    void appendDyn(const PackedVarDynRef& e) {
+        UASSERT(!m_dedupDone, "cannot add after dedup()");
+        m_dyn.push_back(e);
+    }
+    std::vector<PackedVarDynRef>& dyn() { return m_dyn; }
     void dedup() {
         UASSERT(!m_dedupDone, "dedup() called twice");
         dedupRefs(m_lhs);
@@ -915,6 +942,15 @@ public:
         for (const PackedVarRefEntry& ref : m_lhs) {
             points.emplace_back(std::make_pair(ref.lsb(), false));  // Start of a region
             points.emplace_back(std::make_pair(ref.msb() + 1, true));  // End of a region
+        }
+        // Run-time indexed element reads: every element must be its own region so the
+        // read can be rewritten as a mux over the element variables
+        for (const PackedVarDynRef& d : m_dyn) {
+            for (int k = 0; k < d.nElem(); ++k) {
+                const int lsb = m_basicp->lo() + k * d.elemWidth();
+                points.emplace_back(std::make_pair(lsb, false));
+                points.emplace_back(std::make_pair(lsb + d.elemWidth(), true));
+            }
         }
         if (skipUnused && !m_rhs.empty()) {  // Range to be read must be kept, so add points here
             int lsb = m_basicp->hi() + 1;
@@ -1010,6 +1046,10 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
             UINFO(5, varp->prettyName()
                          << " [" << consts[0]->toSInt() << ":+" << consts[1]->toSInt()
                          << "] lsb:" << refit->second.basicp()->lo() << "\n");
+        } else if (tryDynElemRead(nodep, vrefp, refit->second)) {
+            // Accepted as an element read with a run-time index; the index expression
+            // may itself reference split candidates
+            iterateAndNextNull(nodep->lsbp());
         } else {
             warnNoSplit(vrefp->varp(), nodep, "its bit range cannot be determined statically");
             if (!consts[0]) {
@@ -1024,6 +1064,63 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
         }
     }
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+    // A read SEL(var, idx * W, W) of one W-bit element of a variable whose width is a
+    // multiple of W (how V3Width lowers `v[idx]` on a packed array, or `v[idx]` of a
+    // vector for W == 1), with a small element count: record it so the split forces the
+    // element boundaries and the read becomes a mux over the element variables.
+    static constexpr int DYN_ELEM_MAX = 16;
+    bool tryDynElemRead(AstSel* nodep, const AstVarRef* vrefp, PackedVarRef& pref) {
+        if (!vrefp->access().isReadOnly()) return false;
+        if (VN_IS(nodep->backp(), SenItem)) return false;
+        const AstConst* const widthConstp = VN_CAST(nodep->widthp(), Const);
+        if (!widthConstp) return false;
+        const int elemWidth = widthConstp->toSInt();
+        const int varWidth = vrefp->varp()->width();
+        if (elemWidth <= 0 || varWidth % elemWidth != 0) return false;
+        const int nElem = varWidth / elemWidth;
+        if (nElem < 2 || nElem > DYN_ELEM_MAX) return false;
+        // Index expression: lsb / elemWidth, in one of the forms V3Width/V3Const produce.
+        // Width adaptation wrappers around the product (a SEL of its low bits, EXTEND,
+        // CCAST) carry no information for the element index: look through them.
+        AstNodeExpr* idxp = nullptr;
+        AstNodeExpr* lsbp = nodep->lsbp();
+        while (true) {
+            if (AstSel* const wrapp = VN_CAST(lsbp, Sel)) {
+                const AstConst* const lp = VN_CAST(wrapp->lsbp(), Const);
+                if (lp && lp->isZero() && VN_IS(wrapp->widthp(), Const)) {
+                    lsbp = wrapp->fromp();
+                    continue;
+                }
+            } else if (AstExtend* const extp = VN_CAST(lsbp, Extend)) {
+                lsbp = extp->lhsp();
+                continue;
+            } else if (AstCCast* const castp = VN_CAST(lsbp, CCast)) {
+                lsbp = castp->lhsp();
+                continue;
+            }
+            break;
+        }
+        if (elemWidth == 1) {
+            idxp = lsbp;
+        } else if (AstMul* const mulp = VN_CAST(lsbp, Mul)) {
+            if (const AstConst* const cp = VN_CAST(mulp->rhsp(), Const)) {
+                if (cp->toSInt() == elemWidth) idxp = mulp->lhsp();
+            } else if (const AstConst* const cp2 = VN_CAST(mulp->lhsp(), Const)) {
+                if (cp2->toSInt() == elemWidth) idxp = mulp->rhsp();
+            }
+        } else if (AstShiftL* const shp = VN_CAST(lsbp, ShiftL)) {
+            if (const AstConst* const cp = VN_CAST(shp->rhsp(), Const)) {
+                if (cp->toSInt() < 31 && (1 << cp->toSInt()) == elemWidth) idxp = shp->lhsp();
+            }
+        }
+        if (!idxp) return false;
+        if (idxp->width() > 32) return false;
+        pref.appendDyn(PackedVarDynRef{nodep, idxp, elemWidth, nElem});
+        UINFO(5, vrefp->varp()->prettyName() << " element read with run-time index, "
+                                             << nElem << " x " << elemWidth << " bits\n");
+        return true;
+    }
 
     // Extract necessary bit range from a newly created variable to meet ref
     static AstNodeExpr* extractBits(const PackedVarRefEntry& ref, const SplitNewVar& var,
@@ -1151,6 +1248,49 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
             }
         }
     }
+    // The bits [ref.lsb, ref.msb] of the original variable, read from the split variables
+    static AstNodeExpr* readRange(const PackedVarRefEntry& ref,
+                                  const std::vector<SplitNewVar>& vars) {
+        auto varit = std::upper_bound(vars.begin(), vars.end(), ref.lsb(), SplitNewVar::Match());
+        UASSERT_OBJ(varit != vars.end(), ref.nodep(), "Not found");
+        AstNodeExpr* prevp = extractBits(ref, *varit, VAccess::READ);
+        for (int residue = ref.msb() - varit->msb(); residue > 0; residue -= varit->bitwidth()) {
+            ++varit;
+            UASSERT_OBJ(varit != vars.end(), ref.nodep(), "not enough split variables");
+            prevp = new AstConcat{ref.nodep()->fileline(),
+                                  extractBits(ref, *varit, VAccess::READ), prevp};
+        }
+        return prevp;
+    }
+    // Replace every run-time indexed element read by a mux over the element variables:
+    //   SEL(var, idx*W, W)  ->  idx==N-1 ? elem[N-1] : ... : idx==0 ? elem[0] : '0
+    // Elements an index of the given width can never select are left out. An index
+    // outside the array reads zero (the original select reads X / the --x-assign value
+    // there, a case no correct design exercises).
+    void updateDynReferences(PackedVarRef& pref, const std::vector<SplitNewVar>& vars) {
+        for (PackedVarDynRef& d : pref.dyn()) {
+            AstSel* const selp = d.selp();
+            FileLine* const fl = selp->fileline();
+            const int idxWidth = d.idxp()->width();
+            const int reachable
+                = (idxWidth >= 31) ? d.nElem() : std::min(d.nElem(), 1 << idxWidth);
+            AstNodeExpr* muxp = new AstConst{fl, AstConst::WidthedValue{}, d.elemWidth(), 0};
+            for (int k = reachable - 1; k >= 0; --k) {
+                const PackedVarRefEntry elem{selp, pref.basicp()->lo() + k * d.elemWidth(),
+                                             d.elemWidth()};
+                AstNodeExpr* const elemp = readRange(elem, vars);
+                AstNodeExpr* const condp
+                    = new AstEq{fl, d.idxp()->cloneTree(false),
+                                new AstConst{fl, AstConst::WidthedValue{}, idxWidth, k}};
+                muxp = new AstCond{fl, condp, elemp, muxp};
+            }
+            UINFO(4, "Dynamic element read of " << selp->prettyNameQ() << " -> " << reachable
+                                                << "-way mux\n");
+            selp->replaceWith(muxp);
+            VL_DO_DANGLING(selp->deleteTree(), selp);
+        }
+        pref.dyn().clear();
+    }
     // Do the actual splitting operation
     void split() {
         for (auto& pair : m_refs) {
@@ -1169,6 +1309,7 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
             createVars(varp, ref.basicp(), vars);  // Add the split variables
 
             updateReferences(varp, ref, vars);
+            updateDynReferences(ref, vars);
 
             if (varp->isIO()) {  // port cannot be deleted
                 // If varp is a port of a module, single AssignW is sufficient

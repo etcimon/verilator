@@ -212,10 +212,6 @@ static void process() {
     if (v3Global.opt.fConstBeforeDfg()) V3Const::constifyAllLint(v3Global.rootp());
 
     if (!(v3Global.opt.xmlOnly() && !v3Global.opt.flatten())) {
-        // Split packed variables into multiple pieces to resolve UNOPTFLAT.
-        // should be after constifyAllLint() which flattens to 1D bit vector
-        V3SplitVar::splitVariable(v3Global.rootp());
-
         // Remove cell arrays (must be between V3Width and scoping)
         V3Inst::dearrayAll(v3Global.rootp());
         V3LinkDot::linkDotArrayed(v3Global.rootp());
@@ -223,6 +219,22 @@ static void process() {
         // Task inlining & pushing BEGINs names to variables/cells
         // Begin processing must be after Param, before module inlining
         V3Begin::debeginAll(v3Global.rootp());  // Flatten cell names, before inliner
+
+        // Unroll constant-bound procedural loops BEFORE splitting packed variables, so a
+        // `for (int i ...) v[i] ...` access is a constant select when V3SplitVar looks at
+        // it. Upstream splits first and unrolls much later, so every loop-indexed access
+        // is "bit range cannot be determined statically" and the variable stays whole --
+        // the false combinational loops through such variables (issue pointers, per-slot
+        // valid/fire vectors, ready chains) then become hybrid logic with change
+        // triggers and extra scheduler passes. Unrolling here is the same transformation
+        // V3Unroll applies after V3Task; the second call later finds nothing left.
+        // V3Begin must have converted FORs to WHILEs first (hence after debeginAll).
+        V3Unroll::unrollAll(v3Global.rootp());
+        V3Const::constifyAllLint(v3Global.rootp());
+
+        // Split packed variables into multiple pieces to resolve UNOPTFLAT.
+        // should be after constifyAllLint() which flattens to 1D bit vector
+        V3SplitVar::splitVariable(v3Global.rootp());
 
         // Expand inouts, stage 2
         // Also simplify pin connections to always be AssignWs in prep for V3Unknown
