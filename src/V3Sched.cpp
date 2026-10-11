@@ -628,8 +628,20 @@ std::pair<AstVarScope*, AstNodeStmt*> makeEvalLoop(AstNetlist* netlistp, const s
                 ifp->addThensp(new AstAssign{flp, wrefp, new AstAdd{flp, rrefp, onep}});
             }
 
-            // Add body
+            // Add body, bracketed by execution-profile records when --prof-exec: one
+            // EVAL_LOOP_BEGIN/END pair per region iteration that actually ran, so the
+            // profile (verilator_gantt) shows how many act/nba passes each eval needed
+            // and what they cost -- the re-iterations caused by loop-breaking hybrid
+            // logic are otherwise invisible outside a VL_DEBUG trigger dump.
+            if (v3Global.opt.profExec()) {
+                ifp->addThensp(new AstText{
+                    flp, "VL_EXEC_TRACE_ADD_RECORD(vlSymsp).evalLoopBegin();\n", true});
+            }
             ifp->addThensp(makeBody());
+            if (v3Global.opt.profExec()) {
+                ifp->addThensp(new AstText{
+                    flp, "VL_EXEC_TRACE_ADD_RECORD(vlSymsp).evalLoopEnd();\n", true});
+            }
         }
     }));
 
