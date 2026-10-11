@@ -369,10 +369,16 @@ class AstToDfgVisitor final : public VNVisitor {
                 Driver& a = drivers[i];
                 Driver& b = drivers[j];
 
-                // Coalesce adjacent range
+                // Coalesce adjacent range. Only while the result still fits a QData: a wide
+                // coalesced driver is a left-leaning DfgConcat chain that is later emitted
+                // (V3Premit temporaries, above --expand-limit) as one VL_CONCAT_W* runtime
+                // call per link, each copying the whole running vector - O(n^2) words per
+                // evaluation for a variable filled by a generate loop. Separate partial
+                // drivers are emitted as part-select assignments, which V3Expand turns
+                // into stores of only the words they touch.
                 const uint32_t aWidth = a.m_vtxp->width();
                 const uint32_t bWidth = b.m_vtxp->width();
-                if (a.m_lsb + aWidth == b.m_lsb) {
+                if (a.m_lsb + aWidth == b.m_lsb && aWidth + bWidth <= VL_QUADSIZE) {
                     const auto dtypep = DfgVertex::dtypeForWidth(aWidth + bWidth);
                     DfgConcat* const concatp = new DfgConcat{*m_dfgp, a.m_fileline, dtypep};
                     concatp->rhsp(a.m_vtxp);
