@@ -76,14 +76,44 @@ extern std::string VL_TO_STRING_W(int words, const WDataInP obj);
 //===================================================================
 // Activity trigger vector
 
+// Bit-packed: one 64-bit word per 64 triggers, so 'any' over hundreds of triggers
+// is a handful of word ORs (it is evaluated several times per clock), and 'set' /
+// 'andNot' are word operations. 'at' returns a bit proxy that behaves as a bool
+// lvalue, as the generated code assigns to it and tests it.
 template <std::size_t T_size>  //
 class VlTriggerVec final {
     // TODO: static assert T_size > 0, and don't generate when empty
 private:
+    // TYPES
+    using Word = uint64_t;
+    static constexpr std::size_t WORD_BITS = 64;
+    static constexpr std::size_t T_words = (T_size + WORD_BITS - 1) / WORD_BITS;
+
     // MEMBERS
-    std::array<bool, T_size> m_flags;  // State of the assoc array
+    std::array<Word, T_words> m_words;  // Flag bits, 64 per word
 
 public:
+    // Proxy for one flag, usable as a bool lvalue
+    class BitRef final {
+        Word& m_wordr;
+        const Word m_mask;
+
+    public:
+        BitRef(Word& wordr, Word mask)
+            : m_wordr{wordr}
+            , m_mask{mask} {}
+        operator bool() const { return (m_wordr & m_mask) != 0; }
+        BitRef& operator=(bool value) {
+            if (value) {
+                m_wordr |= m_mask;
+            } else {
+                m_wordr &= ~m_mask;
+            }
+            return *this;
+        }
+        BitRef& operator=(const BitRef& other) { return *this = static_cast<bool>(other); }
+    };
+
     // CONSTRUCTOR
     VlTriggerVec() { clear(); }
     ~VlTriggerVec() = default;
@@ -91,26 +121,31 @@ public:
     // METHODS
 
     // Set all elements to false
-    void clear() { m_flags.fill(false); }
+    void clear() { m_words.fill(0); }
 
     // Reference to element at 'index'
-    bool& at(size_t index) { return m_flags.at(index); }
+    BitRef at(size_t index) {
+        return BitRef{m_words.at(index / WORD_BITS), Word{1} << (index % WORD_BITS)};
+    }
+    bool at(size_t index) const {
+        return (m_words.at(index / WORD_BITS) >> (index % WORD_BITS)) & 1;
+    }
 
     // Return true iff at least one element is set
     bool any() const {
-        for (size_t i = 0; i < m_flags.size(); ++i)
-            if (m_flags[i]) return true;
-        return false;
+        Word acc = 0;
+        for (size_t i = 0; i < T_words; ++i) acc |= m_words[i];
+        return acc != 0;
     }
 
     // Set all elements true in 'this' that are set in 'other'
     void set(const VlTriggerVec<T_size>& other) {
-        for (size_t i = 0; i < m_flags.size(); ++i) m_flags[i] |= other.m_flags[i];
+        for (size_t i = 0; i < T_words; ++i) m_words[i] |= other.m_words[i];
     }
 
     // Set elements of 'this' to 'a & !b' element-wise
     void andNot(const VlTriggerVec<T_size>& a, const VlTriggerVec<T_size>& b) {
-        for (size_t i = 0; i < m_flags.size(); ++i) m_flags[i] = a.m_flags[i] && !b.m_flags[i];
+        for (size_t i = 0; i < T_words; ++i) m_words[i] = a.m_words[i] & ~b.m_words[i];
     }
 };
 
