@@ -37,6 +37,7 @@
 
 #include <map>
 #include <tuple>
+#include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -418,6 +419,47 @@ private:
         });
     }
 
+    // For an input port whose actual is a constant: replace every read of the port in the
+    // inlined body with the constant and drop the actual. Returns false (nothing changed)
+    // if the actual is not a plain constant of the port's width, or if the body writes the
+    // port (inputs are local copies in SystemVerilog and may legally be assigned).
+    static bool substituteConstInput(AstNode* beginp, AstVar* portp, AstNodeExpr* pinp) {
+        AstConst* constp = VN_CAST(pinp, Const);
+        if (!constp) {
+            // A parameter reference (e.g. the module's configuration struct) is as good
+            if (AstVarRef* const vrefp = VN_CAST(pinp, VarRef)) {
+                AstVar* const varp = vrefp->varp();
+                if (varp->isParam() && varp->valuep() && VN_IS(varp->valuep(), Const)) {
+                    constp = VN_AS(varp->valuep(), Const);
+                }
+            }
+        }
+        if (!constp) return false;
+        if (constp->width() != portp->width()) return false;
+        if (constp->num().isFourState() || constp->num().isString()) return false;
+        if (!VN_IS(portp->dtypep()->skipRefp(), BasicDType)
+            && !VN_IS(portp->dtypep()->skipRefp(), PackArrayDType)
+            && !VN_IS(portp->dtypep()->skipRefp(), NodeUOrStructDType))
+            return false;
+        std::vector<AstVarRef*> refps;
+        bool written = false;
+        for (AstNode* stmtp = beginp; stmtp; stmtp = stmtp->nextp()) {
+            stmtp->foreach([&](AstVarRef* vrefp) {
+                if (vrefp->varp() != portp) return;
+                if (vrefp->access().isWriteOrRW()) written = true;
+                refps.push_back(vrefp);
+            });
+        }
+        if (written) return false;
+        for (AstVarRef* const vrefp : refps) {
+            AstConst* const newp = constp->cloneTree(false);
+            vrefp->replaceWith(newp);
+            VL_DO_DANGLING(vrefp->deleteTree(), vrefp);
+        }
+        VL_DO_DANGLING(pinp->deleteTree(), pinp);
+        return true;
+    }
+
     AstNode* createInlinedFTask(AstNodeFTaskRef* refp, const string& namePrefix,
                                 AstVarScope* outvscp) {
         // outvscp is the variable for functions only, if nullptr, it's a task
@@ -485,6 +527,13 @@ private:
                                                     true);  // Ok if in <= block
                     // Put assignment BEHIND of all other statements
                     beginp->addNext(assp);
+                } else if (portp->isNonOutput() && substituteConstInput(beginp, portp, pinp)) {
+                    // Constant actual (e.g. a parameter struct passed to a helper function):
+                    // the body now reads the constant directly, so no input temporary, no
+                    // per-call copy, and V3Const folds the selects of it. Wide parameter
+                    // structs (thousands of bits) passed to per-cycle helpers were being
+                    // copied at every call because such wide copies are above the expand
+                    // limit and never substituted away.
                 } else if (portp->isNonOutput()) {
                     // Make input variable
                     AstVarScope* const inVscp
