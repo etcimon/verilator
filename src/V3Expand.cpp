@@ -748,6 +748,11 @@ private:
         if (nodep->user1SetOnce()) return;  // Process once
         iterateChildren(nodep);
         if (nodep->lhsp()->isWide()) {
+            // Beyond the expand limit keep the operator: it is emitted as one
+            // VL_EQ_W/VL_NEQ_W call (a compact word loop the C++ compiler vectorizes)
+            // instead of a straight-line XOR/OR tree over every word -- the trees for
+            // the change-detection triggers of wide signals were thousands of nodes each.
+            if (!doExpand(nodep->lhsp())) return;
             UINFO(8, "    Wordize EQ/NEQ " << nodep << endl);
             // -> (0=={or{for each_word{WORDSEL(lhs,#)^WORDSEL(rhs,#)}}}
             FileLine* const fl = nodep->fileline();
@@ -773,6 +778,8 @@ private:
         iterateChildren(nodep);
         FileLine* const fl = nodep->fileline();
         if (nodep->lhsp()->isWide()) {
+            // Very wide: keep the VL_REDOR_W call (compact loop) rather than a huge tree
+            if (!doExpand(nodep->lhsp())) return;
             UINFO(8, "    Wordize REDOR " << nodep << endl);
             // -> (0!={or{for each_word{WORDSEL(lhs,#)}}}
             AstNodeExpr* newp = nullptr;
@@ -795,6 +802,7 @@ private:
         iterateChildren(nodep);
         FileLine* const fl = nodep->fileline();
         if (nodep->lhsp()->isWide()) {
+            if (!doExpand(nodep->lhsp())) return;  // Keep VL_REDAND_IW for very wide operands
             UINFO(8, "    Wordize REDAND " << nodep << endl);
             // -> (0!={and{for each_word{WORDSEL(lhs,#)}}}
             AstNodeExpr* newp = nullptr;
@@ -824,6 +832,7 @@ private:
         if (nodep->user1SetOnce()) return;  // Process once
         iterateChildren(nodep);
         if (nodep->lhsp()->isWide()) {
+            if (!doExpand(nodep->lhsp())) return;  // Keep VL_REDXOR_W for very wide operands
             UINFO(8, "    Wordize REDXOR " << nodep << endl);
             // -> (0!={redxor{for each_word{XOR(WORDSEL(lhs,#))}}}
             FileLine* const fl = nodep->fileline();
