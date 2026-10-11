@@ -22,6 +22,13 @@
 // Each display (independent transformation; here as Premit is a good point)
 //      If autoflush, insert a flush
 //
+// Each wide ASSIGN(var, CONCAT-tree) without self reference:
+//      Lower into one part-select assignment per leaf of the concat tree, so
+//      V3Expand emits stores for only the words each leaf touches (linear in the
+//      total width). Left as one concat, every nested wide concat gets a wide
+//      temporary here and, above --expand-limit, a VL_CONCAT_W* runtime call that
+//      copies the whole running vector -- quadratic in the number of leaves.
+//
 //*************************************************************************
 
 #include "config_build.h"
@@ -35,6 +42,8 @@
 #include "V3UniqueNames.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -63,8 +72,84 @@ private:
     V3UniqueNames m_tempNames;  // For generating unique temporary variable names
 
     VDouble0 m_extractedToConstPool;  // Statistic tracking
+    VDouble0 m_concatsLowered;  // Statistic tracking: wide concat trees lowered to part selects
+    VDouble0 m_concatLeavesLowered;  // Statistic tracking: leaves of those trees
 
     // METHODS
+    // Leaf of a concat tree with its LSB offset within the whole concat
+    struct ConcatLeaf final {
+        AstNodeExpr* m_exprp;
+        int m_lsb;
+    };
+    // Positions use widthMin(): the logical width of each operand (width() may be the
+    // padded physical width of a narrow operand), as V3Expand does for concat shifts.
+    static void collectConcatLeaves(AstNodeExpr* exprp, int lsb, std::vector<ConcatLeaf>& leaves) {
+        if (AstConcat* const concatp = VN_CAST(exprp, Concat)) {
+            collectConcatLeaves(concatp->rhsp(), lsb, leaves);
+            collectConcatLeaves(concatp->lhsp(), lsb + concatp->rhsp()->widthMin(), leaves);
+        } else {
+            leaves.push_back(ConcatLeaf{exprp, lsb});
+        }
+    }
+    // Lower ASSIGN(var | SEL(var, const), CONCAT-tree) into part-select assignments.
+    // Returns true if nodep was replaced (and deleted).
+    bool lowerWideConcatAssign(AstNodeAssign* nodep, bool selfReferencing) {
+        static const bool disabled = getenv("VERILATOR_NO_CONCAT_LOWER") != nullptr;  // A/B knob
+        if (disabled) return false;
+        if (!m_cfuncp || !nodep->isWide() || selfReferencing) return false;
+        if (m_inWhilep || m_inTracep) return false;  // Keep statement structure simple there
+        if (!VN_IS(nodep, Assign) && !VN_IS(nodep, AssignW)) return false;
+        AstConcat* const concatp = VN_CAST(nodep->rhsp(), Concat);
+        if (!concatp) return false;
+        // Destination: a plain variable, or a constant part select of one
+        AstNodeExpr* const lhsp = nodep->lhsp();
+        int lhsLsb = 0;
+        AstVarRef* dstRefp = VN_CAST(lhsp, VarRef);
+        if (!dstRefp) {
+            AstSel* const selp = VN_CAST(lhsp, Sel);
+            if (!selp || !VN_IS(selp->lsbp(), Const)) return false;
+            dstRefp = VN_CAST(selp->fromp(), VarRef);
+            if (!dstRefp) return false;
+            lhsLsb = selp->lsbConst();
+        }
+        if (AstVar::scVarRecurse(dstRefp)) return false;
+        // Never lower into a statement temporary: V3Subst tracks those per word and the
+        // read-modify-write of an unaligned part-select assignment reads a word before any
+        // assignment to it ("Reading a word that was never assigned"). createDeepTemp()
+        // assignments made while visiting a lowered leaf are visited by this pass too.
+        if (dstRefp->varp()->isStatementTemp()) return false;
+        if (concatp->widthMin() != lhsp->widthMin()) return false;
+        if (lhsLsb + lhsp->widthMin() > dstRefp->varp()->width()) return false;
+        // Collect the leaves; worth lowering when the tree has several leaves or when the
+        // result is too wide for V3Expand to wordize the concat anyway
+        std::vector<ConcatLeaf> leaves;
+        collectConcatLeaves(concatp, 0, leaves);
+        const bool tooWide = nodep->widthWords() > v3Global.opt.expandLimit();
+        if (leaves.size() < 3 && !tooWide) return false;
+        // Sanity: the leaves must tile the concat exactly
+        int total = 0;
+        for (const ConcatLeaf& leaf : leaves) total += leaf.m_exprp->widthMin();
+        if (total != concatp->widthMin()) return false;
+        UINFO(4, "Lower wide concat (" << leaves.size() << " leaves) " << nodep << endl);
+        FileLine* const fl = nodep->fileline();
+        AstNode* newListp = nullptr;
+        for (const ConcatLeaf& leaf : leaves) {
+            AstNodeExpr* const leafp = leaf.m_exprp->unlinkFrBack();
+            AstVarRef* const wrRefp = dstRefp->cloneTree(false);
+            wrRefp->access(VAccess::WRITE);
+            AstSel* const dstSelp
+                = new AstSel{fl, wrRefp, lhsLsb + leaf.m_lsb, leafp->widthMin()};
+            AstNodeAssign* const assignp = nodep->cloneType(dstSelp, leafp);
+            newListp = AstNode::addNext(newListp, assignp);
+        }
+        ++m_concatsLowered;
+        m_concatLeavesLowered += static_cast<double>(leaves.size());
+        // Insert after the original (iteration then continues with the new statements, which
+        // are processed by the regular visitor), and drop the original.
+        nodep->addNextHere(newListp);
+        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+        return true;
+    }
     bool assignNoTemp(AstNodeAssign* nodep) {
         return (VN_IS(nodep->lhsp(), VarRef) && !AstVar::scVarRecurse(nodep->lhsp())
                 && VN_IS(nodep->rhsp(), Const));
@@ -192,6 +277,13 @@ private:
                 nodep->rhsp()->foreach([&noopt](const AstVarRef* refp) {
                     if (refp->access().isReadOnly() && refp->varp()->user3()) noopt = true;
                 });
+            }
+
+            if (!nodep->user1() && lowerWideConcatAssign(nodep, noopt)) {
+                // nodep is gone; its replacements follow it in the list and are
+                // visited by the enclosing iteration.
+                m_stmtp = nullptr;
+                return;
             }
 
             if (noopt && !nodep->user1()) {
@@ -384,6 +476,9 @@ public:
     ~PremitVisitor() override {
         V3Stats::addStat("Optimizations, Prelim extracted value to ConstPool",
                          m_extractedToConstPool);
+        V3Stats::addStat("Optimizations, Prelim wide concat assigns lowered", m_concatsLowered);
+        V3Stats::addStat("Optimizations, Prelim wide concat leaves lowered",
+                         m_concatLeavesLowered);
     }
 };
 
