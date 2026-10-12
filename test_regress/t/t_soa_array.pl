@@ -17,7 +17,7 @@ compile(
 if ($Self->{vlt_all}) {
     file_grep($Self->{stats}, qr/Optimizations, SoA arrays converted\s+(\d+)/, 1);
     file_grep($Self->{stats}, qr/Optimizations, SoA loops kept rolled\s+(\d+)/, 1);
-    file_grep($Self->{stats}, qr/Optimizations, Delayed array-loop shadows\s+(\d+)/, 1);
+    file_grep($Self->{stats}, qr/Optimizations, Delayed array-loop queues\s+(\d+)/, 1);
 }
 
 execute(

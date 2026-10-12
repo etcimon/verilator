@@ -70,6 +70,7 @@ private:
         return false;
     }
 
+    bool m_soaKeepRolled = false;  // index var of the loop under check carries soaNoUnroll
     bool bodySizeOverRecurse(AstNode* nodep, int& bodySize, int bodyLimit) {
         if (!nodep) return false;
         bodySize++;
@@ -82,6 +83,42 @@ private:
         if (bodySizeOverRecurse(nodep->op4p(), bodySize, bodyLimit)) return true;
         // Tail recurse.
         return bodySizeOverRecurse(nodep->nextp(), bodySize, bodyLimit);
+    }
+
+    // True when every per-iteration operation of the body is cheap once the
+    // index is a run-time value: part-selects with a non-constant lsb are at
+    // most 64 bits wide (one or two host words), no non-blocking assignment
+    // targets an array element (V3Delayed's single-slot temporaries cannot
+    // record a rolled loop's indices), and no variable is a split_var target
+    // (V3SplitVar needs constant selects; a rolled loop would un-split it).
+    static bool rolledBodyIsCheap(AstNode* nodep) {
+        for (; nodep; nodep = nodep->nextp()) {
+            if (const AstSel* const selp = VN_CAST(nodep, Sel)) {
+                if (!VN_IS(selp->lsbp(), Const) && selp->width() > 64) return false;
+            }
+            if (const AstAssignDly* const dlyp = VN_CAST(nodep, AssignDly)) {
+                // One-dimensional element NBAs (whole element or a part-select of
+                // it) go through V3Delayed's per-element commit queue when the
+                // loop stays rolled; deeper array nesting keeps the unrolled form.
+                AstNode* lhsp = dlyp->lhsp();
+                if (const AstSel* const sp = VN_CAST(lhsp, Sel)) {
+                    if (!VN_IS(sp->lsbp(), Const) && sp->width() > 64) return false;
+                    lhsp = sp->fromp();
+                }
+                if (const AstArraySel* const asp = VN_CAST(lhsp, ArraySel)) {
+                    if (!VN_IS(asp->fromp(), VarRef)) return false;
+                }
+            }
+            if (const AstNodeVarRef* const refp = VN_CAST(nodep, NodeVarRef)) {
+                if (refp->varp() && refp->varp()->attrSplitVar()) return false;
+            }
+            if (VN_IS(nodep, GenFor) || VN_IS(nodep, GenIf) || VN_IS(nodep, GenCase)) return false;
+            if (!rolledBodyIsCheap(nodep->op1p()) || !rolledBodyIsCheap(nodep->op2p())
+                || !rolledBodyIsCheap(nodep->op3p()) || !rolledBodyIsCheap(nodep->op4p())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool forUnrollCheck(
@@ -174,6 +211,38 @@ private:
                 || bodySizeOverRecurse(bodysp, bodySize /*ref*/, bodyLimit)
                 || bodySizeOverRecurse(incp, bodySize /*ref*/, bodyLimit)) {
                 return cantUnroll(nodep, "too many statements");
+            }
+            // Footprint: a loop whose rolled form is cheap (every dynamic
+            // part-select is narrow, no array NBA, no split_var variable) and
+            // whose unrolled form is large stays a loop. Unrolling it buys
+            // nothing but N copies of the body in the instruction cache (a
+            // cycle-based model streams its whole text every cycle), and the
+            // rolled body costs one bit/word select per iteration. Set by
+            // --unroll-roll-narrow N (0 = off): keep rolled when trips x body
+            // nodes > N. Loops the earlier passes could not have unrolled
+            // (dynamic wide selects, array NBAs -- BLKLOOPINIT) are excluded
+            // because their rolled form is the expensive one.
+            bool keepRolled = m_soaKeepRolled;
+            if (keepRolled) {
+                UINFO(4, "   Keep rolled (SoA table scan, " << loops << " trips): " << nodep << endl);
+                V3Stats::addStatSum("Unrolling kept rolled (SoA scan)", 1);
+            } else if (const int rollNarrow = v3Global.opt.unrollRollNarrow()) {
+                int nodes = 0;
+                if (!bodySizeOverRecurse(bodysp, nodes, 1 << 30)) {}
+                if (loops >= v3Global.opt.unrollRollMinTrips()
+                    && static_cast<int64_t>(loops) * nodes > rollNarrow
+                    && rolledBodyIsCheap(bodysp) && rolledBodyIsCheap(precondsp)) {
+                    UINFO(4, "   Keep rolled (narrow body, " << loops << " x " << nodes
+                                                              << " nodes): " << nodep << endl);
+                    V3Stats::addStatSum("Unrolling kept rolled (narrow body)", 1);
+                    keepRolled = true;
+                }
+            }
+            if (keepRolled) {
+                // V3Delayed turns the array NBAs of this loop into a per-element
+                // commit queue sized from the trip count
+                if (AstWhile* const whilep = VN_CAST(nodep, While)) whilep->unrollTrips(loops);
+                return false;
             }
         }
         // Finally, we can do it
@@ -392,14 +461,14 @@ private:
             if (nodep->incsp()) V3Const::constifyEdit(nodep->incsp());
             // A SoA table scan is cheaper as one loop over the element array
             // than as N unrolled bit extracts. The index variable carries the
-            // mark so it survives cloning of the loop body.
+            // mark so it survives cloning of the loop body. The decision is
+            // taken in forUnrollCheck once the trip count is known, so the
+            // loop carries it for V3Delayed's commit queue.
+            m_soaKeepRolled = false;
             if (initp) {
                 if (const AstAssign* const initAp = VN_CAST(initp, Assign)) {
                     if (const AstVarRef* const idxp = VN_CAST(initAp->lhsp(), VarRef)) {
-                        if (idxp->varp() && idxp->varp()->soaNoUnroll()) {
-                            UINFO(4, "    SoA keep rolled: " << nodep << endl);
-                            return;
-                        }
+                        if (idxp->varp() && idxp->varp()->soaNoUnroll()) m_soaKeepRolled = true;
                     }
                 }
             }

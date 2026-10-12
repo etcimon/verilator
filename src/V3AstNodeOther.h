@@ -3284,6 +3284,7 @@ class AstWhile final : public AstNodeStmt {
     // @astgen op3 := stmtsp : List[AstNode]
     // @astgen op4 := incsp : List[AstNode]
 public:
+    int m_unrollTrips = 0;  // see unrollTrips()
     AstWhile(FileLine* fl, AstNodeExpr* condp, AstNode* stmtsp = nullptr, AstNode* incsp = nullptr)
         : ASTGEN_SUPER_While(fl) {
         this->condp(condp);
@@ -3294,6 +3295,11 @@ public:
     bool isGateOptimizable() const override { return false; }
     int instrCount() const override { return INSTR_COUNT_BRANCH; }
     bool same(const AstNode* /*samep*/) const override { return true; }
+    // Trip count V3Unroll established before it chose to keep this loop
+    // rolled (--unroll-roll-narrow); 0 = unknown. V3Delayed sizes the
+    // per-element commit queue of an array NBA inside the loop from it.
+    int unrollTrips() const { return m_unrollTrips; }
+    void unrollTrips(int trips) { m_unrollTrips = trips; }
     // Stop statement searchback here
     void addBeforeStmt(AstNode* newp, AstNode* belowp) override;
     // Stop statement searchback here

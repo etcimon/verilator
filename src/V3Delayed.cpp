@@ -108,16 +108,6 @@ private:
     VarMap m_modVarMap;  // Table of new var names created under module
     VDouble0 m_statSharedSet;  // Statistic tracking
     std::unordered_map<const AstVarScope*, int> m_scopeVecMap;  // Next var number for each scope
-    // Shadow table for non-blocking element writes inside a loop. One slot
-    // (__Vdlyvdim) cannot record every index a rolled loop writes.
-    struct ArrayShadow final {
-        AstVarScope* shadowp = nullptr;
-        AstVarScope* setp = nullptr;
-        AstVarScope* idxp = nullptr;
-        AstNodeProcedure* procp = nullptr;
-    };
-    std::unordered_map<const AstVarScope*, ArrayShadow> m_arrayShadows;
-    VDouble0 m_statArrayShadows;
 
     // METHODS
 
@@ -187,119 +177,198 @@ private:
         return varscp;
     }
 
-    void insertStmtFront(AstNodeProcedure* procp, AstNode* firstp) {
-        UASSERT_OBJ(firstp, procp, "SoA shadow insert");
-        AstNode* const oldp = procp->stmtsp();
-        if (!oldp) {
-            procp->addStmtsp(firstp);
-            return;
-        }
-        AstNode* const savedp = oldp->unlinkFrBackWithNext();
-        procp->addStmtsp(firstp);
-        AstNode* lastp = firstp;
-        while (lastp->nextp()) lastp = lastp->nextp();
-        lastp->addNext(savedp);
+    // ---- Per-element commit queue for array NBAs inside a rolled loop ----
+    // `arr[idx] <= rhs` (or a part-select of the element) inside a loop that
+    // V3Unroll kept rolled cannot use the single-slot __Vdlyvdim/__Vdlyvval
+    // temporaries (they record one index). Each such loop gets, per array, a
+    // queue of (index, mask, value) entries sized trips x statements; the
+    // body pushes, the NBA region drains in push order:
+    //     arr[dim[k]] = (arr[dim[k]] & ~msk[k]) | val[k]
+    // A queue is closed when its loop ends, so a later NBA to the same array
+    // (single-slot or another loop) is committed after it, in program order.
+    // This replaces the O(table) shadow copy per edge of the first version.
+    struct ArrayQueue final {
+        AstVarScope* cntp = nullptr;
+        AstVarScope* dimp = nullptr;
+        AstVarScope* mskp = nullptr;
+        AstVarScope* valp = nullptr;
+        AstVarScope* kp = nullptr;
+        AstUnpackArrayDType* dimDtp = nullptr;
+        AstUnpackArrayDType* mskDtp = nullptr;
+        AstUnpackArrayDType* valDtp = nullptr;
+        int depth = 0;  // entries needed: sum over queued statements of their trip products
+        int loopLevel = 0;  // the loop that opened it
+    };
+    std::unordered_map<const AstVarScope*, ArrayQueue> m_arrayQueues;  // open queues
+    int m_loopLevel = 0;  // nesting depth of AstWhile
+    int m_loopTrips = 1;  // product of known trip counts of the enclosing loops (0 = unknown)
+    VDouble0 m_statArrayQueues;
+    VDouble0 m_statArrayQueueStmts;
+
+    static AstUnpackArrayDType* newQueueDType(FileLine* fl, AstNodeDType* elemDtp) {
+        AstUnpackArrayDType* const dtp
+            = new AstUnpackArrayDType{fl, elemDtp, new AstRange{fl, 0, 0}};
+        v3Global.rootp()->typeTablep()->addTypesp(dtp);
+        return dtp;
     }
-    AstNode* copyArrayLoop(FileLine* fl, AstVarScope* dstp, AstVarScope* srcp, AstVarScope* idxp,
-                           int elements) {
-        AstAssign* const initp = new AstAssign{
-            fl, new AstVarRef{fl, idxp, VAccess::WRITE}, new AstConst{fl, 0}};
-        AstVarRef* const condIdxp = new AstVarRef{fl, idxp, VAccess::READ};
-        condIdxp->dtypeFrom(idxp);
-        AstLt* const condp = new AstLt{
-            fl, condIdxp, new AstConst{fl, static_cast<uint32_t>(elements)}};
-        AstVarRef* const dstRefp = new AstVarRef{fl, dstp, VAccess::WRITE};
-        dstRefp->dtypeFrom(dstp);
-        AstVarRef* const dstIdxp = new AstVarRef{fl, idxp, VAccess::READ};
-        dstIdxp->dtypeFrom(idxp);
-        AstVarRef* const srcRefp = new AstVarRef{fl, srcp, VAccess::READ};
-        srcRefp->dtypeFrom(srcp);
-        AstVarRef* const srcIdxp = new AstVarRef{fl, idxp, VAccess::READ};
-        srcIdxp->dtypeFrom(idxp);
-        AstAssign* const bodyp = new AstAssign{fl, new AstArraySel{fl, dstRefp, dstIdxp},
-                                               new AstArraySel{fl, srcRefp, srcIdxp}};
-        AstVarRef* const incLp = new AstVarRef{fl, idxp, VAccess::READ};
-        incLp->dtypeFrom(idxp);
-        AstVarRef* const incWp = new AstVarRef{fl, idxp, VAccess::WRITE};
-        incWp->dtypeFrom(idxp);
-        AstAssign* const incp = new AstAssign{
-            fl, incWp, new AstAdd{fl, incLp, new AstConst{fl, 1}}};
-        AstWhile* const loopp = new AstWhile{fl, condp, bodyp, incp};
-        // AstAssign::addNext only accepts AstAssign. Link as a generic statement list.
-        AstNode* const headp = initp;
-        headp->addNext(loopp);
-        return headp;
+    static void resizeQueueDType(AstUnpackArrayDType* dtp, int depth) {
+        AstRange* const oldp = dtp->rangep();
+        AstRange* const newp = new AstRange{dtp->fileline(), depth - 1, 0};
+        oldp->replaceWith(newp);
+        VL_DO_DANGLING(oldp->deleteTree(), oldp);
+        // (an unpacked array's width() is its element width; only the range moves)
     }
-    void retargetVar(AstNode* nodep, AstVarScope* fromp, AstVarScope* top) {
-        if (!nodep) return;
-        if (AstVarRef* const refp = VN_CAST(nodep, VarRef)) {
-            if (refp->varScopep() == fromp) {
-                refp->varScopep(top);
-                refp->varp(top->varp());
-                refp->dtypeFrom(top);
+    // Close the queues opened at this loop level: their depth is final.
+    void closeQueues(int level) {
+        for (auto it = m_arrayQueues.begin(); it != m_arrayQueues.end();) {
+            if (it->second.loopLevel == level) {
+                ArrayQueue& q = it->second;
+                const int depth = q.depth < 1 ? 1 : q.depth;
+                resizeQueueDType(q.dimDtp, depth);
+                resizeQueueDType(q.mskDtp, depth);
+                resizeQueueDType(q.valDtp, depth);
+                it = m_arrayQueues.erase(it);
+            } else {
+                ++it;
             }
         }
-        retargetVar(nodep->op1p(), fromp, top);
-        retargetVar(nodep->op2p(), fromp, top);
-        retargetVar(nodep->op3p(), fromp, top);
-        retargetVar(nodep->op4p(), fromp, top);
     }
-    // Commit `arr[idx] <= rhs` inside a loop by writing a shadow table and
-    // copying it back in the NBA region. Returns true when the assign was
-    // rewritten. A multi-dimensional unpacked array stays on the old path.
-    bool rewriteLoopShadow(AstAssignDly* nodep) {
-        if (!m_procp || !m_activep) return false;
+    static AstNodeExpr* qref(FileLine* fl, AstVarScope* vscp, VAccess access) {
+        return new AstVarRef{fl, vscp, access};
+    }
+    static AstNodeExpr* qelem(FileLine* fl, AstVarScope* arrp, AstVarScope* idxp,
+                              VAccess access) {
+        return new AstArraySel{fl, qref(fl, arrp, access), qref(fl, idxp, VAccess::READ)};
+    }
+    bool rewriteLoopQueue(AstAssignDly* nodep) {
+        if (!m_procp || !m_activep || m_loopTrips <= 0) return false;
         AstNodeExpr* const lhsp = nodep->lhsp();
-        AstNode* basep = lhsp;
-        while (AstSel* const selp = VN_CAST(basep, Sel)) basep = selp->fromp();
-        while (VN_IS(basep, ArraySel)) basep = VN_AS(basep, ArraySel)->fromp();
-        AstVarRef* const varrefp = VN_CAST(basep, VarRef);
-        if (!varrefp || !varrefp->varScopep()) return false;
+        AstSel* const selp = VN_CAST(lhsp, Sel);
+        AstArraySel* const arrselp = VN_CAST(selp ? selp->fromp() : lhsp, ArraySel);
+        if (!arrselp) return false;
+        AstVarRef* const varrefp = VN_CAST(arrselp->fromp(), VarRef);
+        if (!varrefp || !varrefp->varScopep()) return false;  // multi-dimensional: old path
         AstVarScope* const oldvscp = varrefp->varScopep();
         const AstUnpackArrayDType* const adtypep
             = VN_CAST(oldvscp->dtypep()->skipRefp(), UnpackArrayDType);
         if (!adtypep) return false;
-        if (VN_IS(adtypep->subDTypep()->skipRefp(), UnpackArrayDType)) return false;
+        AstNodeDType* const elemDtp = adtypep->subDTypep()->skipRefp();
+        if (VN_IS(elemDtp, UnpackArrayDType) || !elemDtp->isIntegralOrPacked()) return false;
+        if (elemDtp->isDouble() || elemDtp->isString()) return false;
+        const int ew = elemDtp->width();
+        if (selp && !VN_IS(selp->widthp(), Const)) return false;
+        if (selp && (selp->width() > ew)) return false;
 
         FileLine* const fl = nodep->fileline();
-        ArrayShadow& slot = m_arrayShadows[oldvscp];
-        if (!slot.shadowp) {
-            const string base = oldvscp->varp()->shortName();
-            slot.shadowp = createVarSc(oldvscp, "__Vsoa__" + base, 0, oldvscp->dtypep());
-            slot.setp = createVarSc(oldvscp, "__Vsoaset__" + base, 1, nullptr);
-            slot.idxp = createVarSc(oldvscp, "__Vsoai__" + base, 32, nullptr);
-            slot.procp = m_procp;
-            AstAssignPre* const clearp = new AstAssignPre{
-                fl, new AstVarRef{fl, slot.setp, VAccess::WRITE}, new AstConst{fl, 0}};
+        ArrayQueue& q = m_arrayQueues[oldvscp];
+        if (!q.cntp) {
+            const int num = m_scopeVecMap[oldvscp]++;
+            const string base = oldvscp->varp()->shortName() + "__q" + cvtToStr(num);
+            AstNodeDType* const idxDtp = arrselp->bitp()->dtypep();
+            q.dimDtp = newQueueDType(fl, idxDtp);
+            q.mskDtp = newQueueDType(fl, elemDtp);
+            q.valDtp = newQueueDType(fl, elemDtp);
+            q.cntp = createVarSc(oldvscp, "__Vdlyqn__" + base, 32, nullptr);
+            q.kp = createVarSc(oldvscp, "__Vdlyqk__" + base, 32, nullptr);
+            q.dimp = createVarSc(oldvscp, "__Vdlyqd__" + base, 0, q.dimDtp);
+            q.mskp = createVarSc(oldvscp, "__Vdlyqm__" + base, 0, q.mskDtp);
+            q.valp = createVarSc(oldvscp, "__Vdlyqv__" + base, 0, q.valDtp);
+            q.loopLevel = m_loopLevel;
+            // count reset at the start of the active, drain in the array's post block
             AstActive* const actp = createActive(varrefp);
-            actp->addStmtsp(clearp);
-            AstAlwaysPost* const postp
-                = new AstAlwaysPost{fl, nullptr /*sens*/, nullptr /*body*/};
-            actp->addStmtsp(postp);
-            AstIf* const ifp = new AstIf{fl, new AstVarRef{fl, slot.setp, VAccess::READ}};
-            postp->addStmtsp(ifp);
-            ifp->addThensp(copyArrayLoop(fl, oldvscp, slot.shadowp, slot.idxp,
-                                         adtypep->elementsConst()));
-            ifp->addThensp(new AstAssign{fl, new AstVarRef{fl, slot.setp, VAccess::WRITE},
-                                         new AstConst{fl, 0}});
-            insertStmtFront(m_procp, copyArrayLoop(fl, slot.shadowp, oldvscp, slot.idxp,
-                                                   adtypep->elementsConst()));
-            ++m_statArrayShadows;
-            UINFO(4, "  SoA shadow " << oldvscp << endl);
-        } else if (slot.procp != m_procp) {
-            // A second process writing the same table. Keep the single-slot
-            // path for that process rather than sharing one shadow.
-            return false;
+            actp->addStmtsp(new AstAssignPre{fl, qref(fl, q.cntp, VAccess::WRITE),
+                                             new AstConst{fl, 0}});
+            AstAlwaysPost* finalp = VN_AS(oldvscp->user4p(), AlwaysPost);
+            if (!finalp) {
+                finalp = new AstAlwaysPost{fl, nullptr /*sens*/, nullptr /*body*/};
+                AstActive* const newactp = createActive(varrefp);
+                newactp->addStmtsp(finalp);
+                oldvscp->user4p(finalp);
+                finalp->user2p(newactp);
+            } else {
+                checkActivePost(varrefp, VN_AS(finalp->user2p(), Active));
+            }
+            // k = 0; while (k < n) { arr[d[k]] = (arr[d[k]] & ~m[k]) | v[k]; k = k + 1; }
+            AstAssign* const kinitp
+                = new AstAssign{fl, qref(fl, q.kp, VAccess::WRITE), new AstConst{fl, 0}};
+            AstNodeExpr* const condp = new AstLt{fl, qref(fl, q.kp, VAccess::READ),
+                                                 qref(fl, q.cntp, VAccess::READ)};
+            AstVarRef* const arrWp = new AstVarRef{fl, oldvscp, VAccess::WRITE};
+            arrWp->user2(true);  // the drain's blocking write is the NBA commit itself
+            AstNodeExpr* const oldValp = new AstArraySel{
+                fl, new AstVarRef{fl, oldvscp, VAccess::READ}, qelem(fl, q.dimp, q.kp, VAccess::READ)};
+            AstNodeExpr* const keptp = new AstAnd{
+                fl, oldValp, new AstNot{fl, qelem(fl, q.mskp, q.kp, VAccess::READ)}};
+            AstNodeExpr* const newValp
+                = new AstOr{fl, keptp, qelem(fl, q.valp, q.kp, VAccess::READ)};
+            AstAssign* const bodyp = new AstAssign{
+                fl, new AstArraySel{fl, arrWp, qelem(fl, q.dimp, q.kp, VAccess::READ)}, newValp};
+            AstAssign* const incp = new AstAssign{
+                fl, qref(fl, q.kp, VAccess::WRITE),
+                new AstAdd{fl, qref(fl, q.kp, VAccess::READ), new AstConst{fl, 1}}};
+            AstWhile* const drainp = new AstWhile{fl, condp, bodyp, incp};
+            finalp->addStmtsp(kinitp);
+            finalp->addStmtsp(drainp);
+            // a later single-slot NBA to this array must not share an IF chain across the drain
+            finalp->user3p(nullptr);
+            finalp->user4p(nullptr);
+            ++m_statArrayQueues;
+            UINFO(4, "  NBA queue " << oldvscp << " trips=" << m_loopTrips << endl);
         }
+        q.depth += m_loopTrips;
+        ++m_statArrayQueueStmts;
 
-        AstNodeExpr* const newlhsp = lhsp->cloneTree(false);
-        retargetVar(newlhsp, oldvscp, slot.shadowp);
-        AstAssign* const blk = new AstAssign{fl, newlhsp, nodep->rhsp()->unlinkFrBack()};
-        AstAssign* const setp = new AstAssign{
-            fl, new AstVarRef{fl, slot.setp, VAccess::WRITE},
-            new AstConst{fl, AstConst::BitTrue{}}};
-        nodep->addNextHere(setp);
-        nodep->replaceWith(blk);
+        // push: d[n] = idx; m[n] = mask; v[n] = value << lsb; n = n + 1
+        AstNodeExpr* const idxp = arrselp->bitp()->unlinkFrBack();
+        AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
+        AstNodeExpr* maskp = nullptr;
+        AstNodeExpr* valp = nullptr;
+        if (!selp) {
+            V3Number ones{nodep, ew};
+            ones.setAllBits1();
+            maskp = new AstConst{fl, ones};
+            if (rhsp->width() == ew) {
+                valp = rhsp;
+            } else {
+                valp = new AstExtend{fl, rhsp};
+                valp->dtypeFrom(elemDtp);
+            }
+        } else {
+            const int sw = selp->widthConst();
+            AstNodeExpr* const lsbp = selp->lsbp()->unlinkFrBack();
+            V3Number lowOnes{nodep, ew};
+            lowOnes.setMask(sw);
+            AstNodeExpr* extp = rhsp;
+            if (rhsp->width() != ew) {
+                extp = new AstExtend{fl, rhsp};
+                extp->dtypeFrom(elemDtp);
+            }
+            if (VN_IS(lsbp, Const)) {
+                const int lsb = VN_AS(lsbp, Const)->toSInt();
+                V3Number m{nodep, ew};
+                m.opShiftL(lowOnes, V3Number{nodep, 32, static_cast<uint32_t>(lsb)});
+                maskp = new AstConst{fl, m};
+                AstNodeExpr* const shp
+                    = new AstShiftL{fl, extp, new AstConst{fl, static_cast<uint32_t>(lsb)}};
+                shp->dtypeFrom(elemDtp);
+                valp = shp;
+                VL_DO_DANGLING(lsbp->deleteTree(), lsbp);
+            } else {
+                AstNodeExpr* const mshp = new AstShiftL{fl, new AstConst{fl, lowOnes}, lsbp};
+                mshp->dtypeFrom(elemDtp);
+                maskp = mshp;
+                AstNodeExpr* const shp = new AstShiftL{fl, extp, lsbp->cloneTree(false)};
+                shp->dtypeFrom(elemDtp);
+                valp = shp;
+            }
+        }
+        AstNode* const listp = new AstAssign{fl, qelem(fl, q.dimp, q.cntp, VAccess::WRITE), idxp};
+        listp->addNext(new AstAssign{fl, qelem(fl, q.mskp, q.cntp, VAccess::WRITE), maskp});
+        listp->addNext(new AstAssign{fl, qelem(fl, q.valp, q.cntp, VAccess::WRITE), valp});
+        listp->addNext(new AstAssign{
+            fl, qref(fl, q.cntp, VAccess::WRITE),
+            new AstAdd{fl, qref(fl, q.cntp, VAccess::READ), new AstConst{fl, 1}}});
+        nodep->replaceWith(listp);
         VL_DO_DANGLING(nodep->deleteTree(), nodep);
         return true;
     }
@@ -655,7 +724,7 @@ private:
         const bool isArray = VN_IS(nodep->lhsp(), ArraySel)
                              || (VN_IS(nodep->lhsp(), Sel)
                                  && VN_IS(VN_AS(nodep->lhsp(), Sel)->fromp(), ArraySel));
-        if (m_inLoop && isArray && !m_inSuspendableOrFork && rewriteLoopShadow(nodep)) {
+        if (m_inLoop && isArray && !m_inSuspendableOrFork && rewriteLoopQueue(nodep)) {
             return;
         }
         if (m_inSuspendableOrFork || isArray) {
@@ -746,9 +815,15 @@ private:
     }
     void visit(AstWhile* nodep) override {
         VL_RESTORER(m_inLoop);
+        VL_RESTORER(m_loopTrips);
         {
             m_inLoop = true;
+            ++m_loopLevel;
+            const int trips = nodep->unrollTrips();
+            m_loopTrips = (trips > 0 && m_loopTrips > 0) ? m_loopTrips * trips : 0;
             iterateChildren(nodep);
+            closeQueues(m_loopLevel);
+            --m_loopLevel;
         }
     }
 
@@ -760,7 +835,8 @@ public:
     explicit DelayedVisitor(AstNetlist* nodep) { iterate(nodep); }
     ~DelayedVisitor() override {
         V3Stats::addStat("Optimizations, Delayed shared-sets", m_statSharedSet);
-        V3Stats::addStat("Optimizations, Delayed array-loop shadows", m_statArrayShadows);
+        V3Stats::addStat("Optimizations, Delayed array-loop queues", m_statArrayQueues);
+        V3Stats::addStat("Optimizations, Delayed array-loop queue stmts", m_statArrayQueueStmts);
     }
 };
 

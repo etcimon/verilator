@@ -317,6 +317,8 @@ private:
     int         m_traceThreads = 0; // main switch: --trace-threads
     int         m_unrollCount = 64;  // main switch: --unroll-count
     int         m_unrollStmts = 30000;  // main switch: --unroll-stmts
+    int         m_unrollRollNarrow = 0;  // main switch: --unroll-roll-narrow: keep large narrow-body loops rolled
+    int         m_unrollRollMinTrips = 4;  // main switch: --unroll-roll-min-trips: ... with at least this many trips
     int         m_verilateJobs = -1;  // main switch: --verilate-jobs
 
     int         m_compLimitBlocks = 0;  // compiler selection; number of nested blocks
@@ -565,6 +567,8 @@ public:
     }
     int unrollCount() const { return m_unrollCount; }
     int unrollStmts() const { return m_unrollStmts; }
+    int unrollRollNarrow() const { return m_unrollRollNarrow; }
+    int unrollRollMinTrips() const { return m_unrollRollMinTrips; }
     int verilateJobs() const { return m_verilateJobs; }
 
     int compLimitBlocks() const { return m_compLimitBlocks; }

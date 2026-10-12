@@ -944,6 +944,8 @@ void V3Options::parseOpts(FileLine* fl, int argc, char** argv) {
     // user's extra arguments cannot otherwise be A/B'd without editing them).
     if (const char* const envp = getenv("VERILATOR_UNROLL_COUNT")) m_unrollCount = atoi(envp);
     if (const char* const envp = getenv("VERILATOR_UNROLL_STMTS")) m_unrollStmts = atoi(envp);
+    if (const char* const envp = getenv("VERILATOR_UNROLL_ROLL_NARROW")) m_unrollRollNarrow = atoi(envp);
+    if (const char* const envp = getenv("VERILATOR_UNROLL_ROLL_MIN_TRIPS")) m_unrollRollMinTrips = atoi(envp);
     // VERILATOR_FNO=soa,prio,wake,clock-skip,split-plan,dirty,table: force those -f
     // optimizations off after every -O<n> on the command line (build flows that append
     // -O3 after the user's arguments re-enable everything a leading -fno- disabled).
@@ -1534,6 +1536,8 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-no-unlimited-stack", CbCall, []() {});  // Processed only in bin/verilator shell
     DECL_OPTION("-unroll-count", Set, &m_unrollCount).undocumented();  // Optimization tweak
     DECL_OPTION("-unroll-stmts", Set, &m_unrollStmts).undocumented();  // Optimization tweak
+    DECL_OPTION("-unroll-roll-narrow", Set, &m_unrollRollNarrow);  // keep large narrow-body loops rolled
+    DECL_OPTION("-unroll-roll-min-trips", Set, &m_unrollRollMinTrips);
     DECL_OPTION("-unused-regexp", Set, &m_unusedRegexp);
 
     DECL_OPTION("-V", CbCall, [this]() {
