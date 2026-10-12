@@ -1969,6 +1969,14 @@ private:
         VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
     }
 
+    // A constant, or a concatenation of constants not yet folded by this pass
+    static bool isConstTree(const AstNode* nodep) {
+        if (VN_IS(nodep, Const)) return true;
+        if (const AstConcat* const cp = VN_CAST(nodep, Concat)) {
+            return isConstTree(cp->lhsp()) && isConstTree(cp->rhsp());
+        }
+        return false;
+    }
     bool replaceAssignMultiSel(AstNodeAssign* nodep) {
         // Multiple assignments to sequential bits can be concated
         // ASSIGN(SEL(a),aq), ASSIGN(SEL(a+1),bq) -> ASSIGN(SEL(a:b),CONCAT(aq,bq)
@@ -2004,7 +2012,12 @@ private:
         // wide temporaries and VL_CONCAT_W* calls that each copy the whole
         // vector (quadratic in the number of parts). Narrow merges still pay:
         // the bits combine into one word operation.
-        if (sel1p->width() + sel2p->width() > VL_QUADSIZE) return false;
+        // Two constant parts merge into one constant (the concat folds at once),
+        // so a constant-driven table -- a generate's `assign lut[j] = j` -- still
+        // becomes a single constant assignment that V3Gate can substitute into
+        // its readers, however wide; only the runtime concat chain is bounded.
+        const bool bothConst = isConstTree(nodep->rhsp()) && isConstTree(nextp->rhsp());
+        if (!bothConst && sel1p->width() + sel2p->width() > VL_QUADSIZE) return false;
         // Swap?
         if ((con1p->toSInt() != con2p->toSInt() + sel2p->width())
             && (con2p->toSInt() != con1p->toSInt() + sel1p->width())) {

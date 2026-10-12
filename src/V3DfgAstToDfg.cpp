@@ -288,6 +288,16 @@ class AstToDfgVisitor final : public VNVisitor {
     }
 
     // Canonicalize packed variables
+    // A constant, or a concatenation of constants (the running result of merging
+    // constant drivers below -- the peephole folds it to one constant later).
+    static bool isConstTree(const DfgVertex* vtxp) {
+        if (vtxp->is<DfgConst>()) return true;
+        if (const DfgConcat* const cp = vtxp->cast<DfgConcat>()) {
+            return isConstTree(cp->lhsp()) && isConstTree(cp->rhsp());
+        }
+        return false;
+    }
+
     void canonicalizePacked() {
         for (DfgVarPacked* const varp : m_varPackedps) {
             // Delete variables with no sinks nor sources (this can happen due to reverting
@@ -378,7 +388,11 @@ class AstToDfgVisitor final : public VNVisitor {
                 // into stores of only the words they touch.
                 const uint32_t aWidth = a.m_vtxp->width();
                 const uint32_t bWidth = b.m_vtxp->width();
-                if (a.m_lsb + aWidth == b.m_lsb && aWidth + bWidth <= VL_QUADSIZE) {
+                // Constant parts fold into one constant: a generate's constant table
+                // (`assign lut[j] = j`) must become a single constant driver so the
+                // reads of it constant-fold, however wide the table is.
+                const bool bothConst = isConstTree(a.m_vtxp) && isConstTree(b.m_vtxp);
+                if (a.m_lsb + aWidth == b.m_lsb && (bothConst || aWidth + bWidth <= VL_QUADSIZE)) {
                     const auto dtypep = DfgVertex::dtypeForWidth(aWidth + bWidth);
                     DfgConcat* const concatp = new DfgConcat{*m_dfgp, a.m_fileline, dtypep};
                     concatp->rhsp(a.m_vtxp);
