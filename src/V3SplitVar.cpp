@@ -922,6 +922,10 @@ public:
     }
     void appendDyn(const PackedVarDynRef& e) {
         UASSERT(!m_dedupDone, "cannot add after dedup()");
+        // The same SEL can be visited twice (e.g. as the index of an unpacked-array
+        // write that an earlier pass re-traverses); it must be replaced exactly once.
+        for (const PackedVarDynRef& d : m_dyn)
+            if (d.selp() == e.selp()) return;
         m_dyn.push_back(e);
     }
     std::vector<PackedVarDynRef>& dyn() { return m_dyn; }
@@ -1045,7 +1049,8 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
                 vrefp->access());
             UINFO(5, varp->prettyName()
                          << " [" << consts[0]->toSInt() << ":+" << consts[1]->toSInt()
-                         << "] lsb:" << refit->second.basicp()->lo() << "\n");
+                         << "] lsb:" << refit->second.basicp()->lo() << " " << cvtToHex(nodep)
+                         << " " << nodep->fileline() << "\n");
         } else if (tryDynElemRead(nodep, vrefp, refit->second)) {
             // Accepted as an element read with a run-time index; the index expression
             // may itself reference split candidates
@@ -1116,9 +1121,20 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
         }
         if (!idxp) return false;
         if (idxp->width() > 32) return false;
+        // The index expression is cloned into every mux arm and the original deleted
+        // with the SEL: a reference to another split candidate inside it (a[b[i]])
+        // would leave that variable's registered reference dangling and its clones
+        // unregistered. Such reads keep the outer variable whole.
+        bool idxSplitRef = false;
+        nodep->lsbp()->foreach([&](const AstVarRef* refp) {
+            if (refp->varp()->attrSplitVar()) idxSplitRef = true;
+        });
+        if (idxSplitRef) return false;
         pref.appendDyn(PackedVarDynRef{nodep, idxp, elemWidth, nElem});
         UINFO(5, vrefp->varp()->prettyName() << " element read with run-time index, "
-                                             << nElem << " x " << elemWidth << " bits\n");
+                                             << nElem << " x " << elemWidth << " bits "
+                                             << cvtToHex(nodep) << " " << nodep->fileline()
+                                             << "\n");
         return true;
     }
 
@@ -1270,6 +1286,7 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
     void updateDynReferences(PackedVarRef& pref, const std::vector<SplitNewVar>& vars) {
         for (PackedVarDynRef& d : pref.dyn()) {
             AstSel* const selp = d.selp();
+            UINFO(4, "Dynamic element read update " << cvtToHex(selp) << "\n");
             FileLine* const fl = selp->fileline();
             const int idxWidth = d.idxp()->width();
             const int reachable

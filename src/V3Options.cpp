@@ -939,6 +939,12 @@ void V3Options::parseOpts(FileLine* fl, int argc, char** argv) {
     // Initial entry point from Verilator.cpp
     parseOptsList(fl, ".", argc, argv);
 
+    // Experiment overrides for the unroll limits, applied after every command-line and -f
+    // occurrence (build flows that hard-code --unroll-count/--unroll-stmts after the
+    // user's extra arguments cannot otherwise be A/B'd without editing them).
+    if (const char* const envp = getenv("VERILATOR_UNROLL_COUNT")) m_unrollCount = atoi(envp);
+    if (const char* const envp = getenv("VERILATOR_UNROLL_STMTS")) m_unrollStmts = atoi(envp);
+
     // Default certain options and error check
     // Detailed error, since this is what we often get when run with minimal arguments
     const V3StringList& vFilesList = vFiles();
