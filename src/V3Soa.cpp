@@ -222,10 +222,13 @@ int elementWidth(const AstPackArrayDType* adtypep) {
     return elwidth;
 }
 
+// Every reference form counts: a hierarchical probe (AstVarXRef, e.g. a testbench
+// reading i_frontend.table[s].field) that is missed here would keep the packed view of
+// a converted variable and the generated C++ would not compile.
 class SoaCollectVisitor final : public VNVisitor {
 public:
-    std::unordered_map<AstVar*, std::vector<AstVarRef*>> refs;
-    void visit(AstVarRef* nodep) override { refs[nodep->varp()].push_back(nodep); }
+    std::unordered_map<AstVar*, std::vector<AstNodeVarRef*>> refs;
+    void visit(AstNodeVarRef* nodep) override { refs[nodep->varp()].push_back(nodep); }
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 };
 
@@ -356,7 +359,7 @@ class SoaVisitor final : public VNVisitor {
     VDouble0 m_arrays;
     VDouble0 m_loops;
 
-    bool convert(AstVar* varp, const std::vector<AstVarRef*>& refps) {
+    bool convert(AstVar* varp, const std::vector<AstNodeVarRef*>& refps) {
         if (varBlocked(varp)) {
             UINFO(4, "  SoA skip blocked " << varp->prettyNameQ() << endl);
             return false;
@@ -385,7 +388,7 @@ class SoaVisitor final : public VNVisitor {
         };
         std::vector<Use> uses;
         uses.reserve(refps.size());
-        for (AstVarRef* const refp : refps) {
+        for (AstNodeVarRef* const refp : refps) {
             AstSel* const selp = VN_CAST(refp->backp(), Sel);
             if (!selp || selp->fromp() != refp) {
                 UINFO(4, "  SoA skip ref parent " << refp << " back " << refp->backp() << endl);

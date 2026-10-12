@@ -944,6 +944,28 @@ void V3Options::parseOpts(FileLine* fl, int argc, char** argv) {
     // user's extra arguments cannot otherwise be A/B'd without editing them).
     if (const char* const envp = getenv("VERILATOR_UNROLL_COUNT")) m_unrollCount = atoi(envp);
     if (const char* const envp = getenv("VERILATOR_UNROLL_STMTS")) m_unrollStmts = atoi(envp);
+    // VERILATOR_FNO=soa,prio,wake,clock-skip,split-plan,dirty,table: force those -f
+    // optimizations off after every -O<n> on the command line (build flows that append
+    // -O3 after the user's arguments re-enable everything a leading -fno- disabled).
+    if (const char* const envp = getenv("VERILATOR_FNO")) {
+        std::string list{envp};
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            size_t next = list.find(',', pos);
+            if (next == std::string::npos) next = list.size();
+            const std::string item = list.substr(pos, next - pos);
+            if (item == "soa") m_fSoa = false;
+            else if (item == "prio") m_fPrio = false;
+            else if (item == "wake") m_fWake = false;
+            else if (item == "clock-skip") m_fClockSkip = false;
+            else if (item == "split-plan") m_fSplitPlan = false;
+            else if (item == "dirty") m_fDirty = false;
+            else if (item == "table") m_fTable = false;
+            else if (item == "table-slice") m_fTableSlice = false;
+            else if (!item.empty()) fl->v3warn(E_UNSUPPORTED, "VERILATOR_FNO: unknown item '" << item << "'");
+            pos = next + 1;
+        }
+    }
 
     // Default certain options and error check
     // Detailed error, since this is what we often get when run with minimal arguments
@@ -1207,6 +1229,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-fwake", FOnOff, &m_fWake);
     DECL_OPTION("-fclock-skip", FOnOff, &m_fClockSkip);
     DECL_OPTION("-fsplit-plan", FOnOff, &m_fSplitPlan);
+    DECL_OPTION("-ftable-slice", FOnOff, &m_fTableSlice);
     DECL_OPTION("-fdirty", FOnOff, &m_fDirty);
     DECL_OPTION("-freorder", FOnOff, &m_fReorder);
     DECL_OPTION("-fsplit", FOnOff, &m_fSplit);
@@ -1982,12 +2005,8 @@ void V3Options::optimize(int level) {
     m_fLocalize = flag;
     m_fMergeCond = flag;
     m_fReloop = flag;
-    m_fPrio = flag;
-    m_fSoa = flag;
-    m_fWake = flag;
-    m_fClockSkip = flag;
-    m_fSplitPlan = flag;
-    m_fDirty = flag;
+    // m_fPrio, m_fSoa, m_fWake, m_fDirty, m_fClockSkip, m_fSplitPlan, m_fTableSlice are
+    // opt-in only (see V3Options.h)
     m_fReorder = flag;
     m_fSplit = flag;
     m_fSubst = flag;

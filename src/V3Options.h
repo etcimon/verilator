@@ -366,12 +366,26 @@ private:
     bool m_fMergeCondMotion = true; // main switch: -fno-merge-cond-motion: perform code motion
     bool m_fMergeConstPool = true;  // main switch: -fno-merge-const-pool
     bool m_fReloop;      // main switch: -fno-reloop: reform loops
-    bool m_fPrio = true;  // main switch: -fno-prio: ctz lowering of lzc / grant
-    bool m_fSoa = true;  // main switch: -fno-soa: element tables for packed arrays
-    bool m_fWake = true;  // main switch: -fno-wake: inverted tag wakeup table
-    bool m_fClockSkip = true;  // main switch: -fno-clock-skip: skip stable instance combo
-    bool m_fSplitPlan = true;  // main switch: -fno-split-plan: auto split_var on combo cycles
-    bool m_fDirty = true;  // main switch: -fno-dirty: dirty-bit hybrid triggers
+    // Opt-in (not part of -O<n>). Measured on the CVA6 OoO core (g6lc64_ooo, s11
+    // probe, callgrind): -fsoa -fprio -fwake -fdirty together are +2 % instructions per
+    // cycle with no wall-clock gain -- the hot packed arrays (issue queue, scoreboard)
+    // are ports, split_var targets or whole-entry reads, so SoA never reaches them;
+    // 51 lzc lowerings and one wakeup index are not on the critical path.
+    bool m_fPrio = false;  // -fprio: ctz lowering of lzc / grant (opt-in)
+    bool m_fSoa = false;  // -fsoa: element tables for packed arrays (opt-in)
+    bool m_fWake = false;  // -fwake: inverted tag wakeup table (opt-in)
+    // Opt-in (not part of -O<n>): -fclock-skip memoizes per-instance combinational
+    // statements on a shadow compare of their inputs; it samples those inputs at the top
+    // of the function, before earlier statements of the same function update them, so
+    // a parent->child chain inside one function can be skipped with stale outputs (the
+    // CVA6 OoO core does not fetch with it on). -fsplit-plan marks every variable in a
+    // combinational cycle for split_var; on CVA6 that over-splits past the hand list
+    // (+33 % instructions per cycle). -ftable-slice tables a wide decoder per output
+    // support mask; measured +2 % instructions per cycle on CVA6.
+    bool m_fClockSkip = false;  // -fclock-skip: skip stable instance combo (opt-in)
+    bool m_fSplitPlan = false;  // -fsplit-plan: auto split_var on combo cycles (opt-in)
+    bool m_fTableSlice = false;  // -ftable-slice: slice wide tables by output support (opt-in)
+    bool m_fDirty = false;  // -fdirty: dirty-bit hybrid triggers (opt-in, see above)
     bool m_fReorder;     // main switch: -fno-reorder: reorder assignments in blocks
     bool m_fSplit;       // main switch: -fno-split: always assignment splitting
     bool m_fSubst;       // main switch: -fno-subst: substitute expression temp values
@@ -639,6 +653,7 @@ public:
     bool fSubst() const { return m_fSubst; }
     bool fSubstConst() const { return m_fSubstConst; }
     bool fTable() const { return m_fTable; }
+    bool fTableSlice() const { return m_fTableSlice; }
 
     string traceClassBase() const { return m_traceFormat.classBase(); }
     string traceClassLang() const { return m_traceFormat.classBase() + (systemC() ? "Sc" : "C"); }

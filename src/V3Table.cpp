@@ -408,6 +408,7 @@ private:
     };
 
     bool sliceCandidate() const {
+        if (!v3Global.opt.fTableSlice()) return false;
         if (m_why.find("too much space") == string::npos
             && m_why.find("bad tradeoff") == string::npos) {
             return false;
