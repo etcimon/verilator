@@ -390,6 +390,19 @@ private:
             AstNode* incp = nullptr;  // Should be last statement
             AstNode* stmtsp = nodep->stmtsp();
             if (nodep->incsp()) V3Const::constifyEdit(nodep->incsp());
+            // A SoA table scan is cheaper as one loop over the element array
+            // than as N unrolled bit extracts. The index variable carries the
+            // mark so it survives cloning of the loop body.
+            if (initp) {
+                if (const AstAssign* const initAp = VN_CAST(initp, Assign)) {
+                    if (const AstVarRef* const idxp = VN_CAST(initAp->lhsp(), VarRef)) {
+                        if (idxp->varp() && idxp->varp()->soaNoUnroll()) {
+                            UINFO(4, "    SoA keep rolled: " << nodep << endl);
+                            return;
+                        }
+                    }
+                }
+            }
             // cppcheck-suppress duplicateCondition
             if (nodep->incsp()) {
                 incp = nodep->incsp();

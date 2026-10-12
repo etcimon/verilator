@@ -124,6 +124,71 @@ public:
     }
 };
 
+// One done-bit per MTask. Even evaluations set the bit when the task
+// finishes; odd evaluations clear it. A task is ready when every
+// predecessor bit is set (even) or every predecessor bit is clear (odd).
+// The wait is one atomic load and an AND per word, not a yield per edge.
+// 16 words cover 1024 tasks, which is finer than the default partition.
+class VlMTaskDoneMask final {
+    static constexpr unsigned WORDS = 16;
+
+    std::atomic<uint64_t> m_word[WORDS];
+
+    bool wordReady(unsigned word, bool evenCycle, uint64_t pred) const {
+        const uint64_t got = m_word[word].load(std::memory_order_acquire);
+        return evenCycle ? ((got & pred) == pred) : ((got & pred) == 0);
+    }
+    void spinUntil(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
+        unsigned ct = 0;
+        while (VL_UNLIKELY(!ready(evenCycle, predp, nWords))) {
+            VL_CPU_RELAX();
+            ++ct;
+            if (VL_UNLIKELY(ct > VL_LOCK_SPINS)) {
+                ct = 0;
+                VlMTaskVertex::yieldThread();
+            }
+        }
+    }
+
+public:
+    static constexpr unsigned words() { return WORDS; }
+
+    VlMTaskDoneMask() {
+        for (unsigned i = 0; i < WORDS; ++i) m_word[i].store(0, std::memory_order_relaxed);
+    }
+    ~VlMTaskDoneMask() = default;
+
+    // Bit of the task that just finished. Even sets it, odd clears it.
+    void signal(uint32_t bit, bool evenCycle) {
+        const uint32_t word = bit >> 6;
+        const uint64_t mask = static_cast<uint64_t>(1) << (bit & 63);
+        assert(word < WORDS);
+        if (evenCycle) {
+            m_word[word].fetch_or(mask, std::memory_order_release);
+        } else {
+            m_word[word].fetch_and(static_cast<uint64_t>(~mask), std::memory_order_release);
+        }
+    }
+
+    bool ready(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
+        assert(nWords <= WORDS);
+        for (unsigned i = 0; i < nWords; ++i) {
+            if (predp[i] && !wordReady(i, evenCycle, predp[i])) return false;
+        }
+        return true;
+    }
+    bool ready(bool evenCycle, uint64_t pred) const { return wordReady(0, evenCycle, pred); }
+
+    void wait(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
+        spinUntil(evenCycle, predp, nWords);
+    }
+    void wait(bool evenCycle, uint64_t pred) const {
+        if (!pred) return;
+        const uint64_t storage = pred;
+        spinUntil(evenCycle, &storage, 1);
+    }
+};
+
 class VlWorkerThread final {
 private:
     // TYPES

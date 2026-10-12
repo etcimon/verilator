@@ -1,0 +1,32 @@
+#!/usr/bin/env perl
+if (!$::Driver) { use FindBin; exec("$FindBin::Bin/bootstrap.pl", @ARGV, $0); die; }
+# DESCRIPTION: Verilator: Verilog Test driver/expect definition
+#
+# Copyright 2003-2023 by Wilson Snyder. This program is free software; you
+# can redistribute it and/or modify it under the terms of either the GNU
+# Lesser General Public License Version 3 or the Perl Artistic License
+# Version 2.0.
+# SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+
+scenarios(simulator => 1);
+
+compile(
+    verilator_flags2 => ["--stats", "--debug-check"],
+    );
+
+if ($Self->{vlt_all}) {
+    # 4-bit tree root + cnt + empty, 3-bit root + cnt + empty,
+    # balanced tern, linear chain, ctz loop, clz loop, grant.
+    file_grep($Self->{stats}, qr/Optimizations, Priority encoders lowered\s+(\d+)/, 11);
+    my @files = glob_all("$Self->{obj_dir}/$Self->{vm_prefix}___024root__DepSet_*.cpp");
+    file_grep_any(\@files, qr/VL_LZC_CTZ_/);
+    file_grep_any(\@files, qr/VL_LZC_CLZ_/);
+    file_grep_any(\@files, qr/VL_LSBONEHOT_/);
+}
+
+execute(
+    check_finished => 1,
+    );
+
+ok(1);
+1;

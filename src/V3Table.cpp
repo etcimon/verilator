@@ -17,7 +17,10 @@
 //      Look at all large always and assignments.
 //      Count # of input bits and # of output bits, and # of statements
 //      If high # of statements relative to inpbits*outbits,
-//      replace with lookup table
+//      replace with lookup table.
+//      A wide input (a decoder) is sliced: each output is tabled on only
+//      the input bits its expression actually reads, so a 32-bit
+//      instruction becomes a few small indexes instead of one 2^32 table.
 //
 //*************************************************************************
 
@@ -32,6 +35,8 @@
 #include "V3Stats.h"
 
 #include <cmath>
+#include <map>
+#include <unordered_map>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -155,6 +160,7 @@ private:
     // STATE
     double m_totalBytes = 0;  // Total bytes in tables created
     VDouble0 m_statTablesCre;  // Statistic tracking
+    VDouble0 m_statSlices;  // Sliced tables (one per independent input mask)
 
     //  State cleared on each module
     AstNodeModule* m_modp = nullptr;  // Current MODULE
@@ -169,6 +175,9 @@ private:
     unsigned m_outWidthBytes = 0;  // Output table width - in bytes
     std::vector<AstVarScope*> m_inVarps;  // Input variable list
     std::vector<TableOutputVar> m_outVarps;  // Output variable list
+    string m_why;  // Why the full table was refused, empty if it was accepted
+    int m_instrs = 0;  // Instruction nodes in the block under test
+    int m_dataCount = 0;
 
     // METHODS
 
@@ -236,6 +245,9 @@ private:
                                 << m_outWidthBytes << " Spacetime=" << (space / time) << "("
                                 << space << "/" << time << ")"
                                 << ": " << nodep << endl);
+        m_instrs = chkvis.instrCount();
+        m_dataCount = chkvis.dataCount();
+        m_why = chkvis.optimizable() ? "" : chkvis.whyNotMessage();
         if (chkvis.optimizable()) {
             UINFO(3, " Table Optimize spacetime=" << (space / time) << " " << nodep << endl);
             m_totalBytes += space;
@@ -379,6 +391,384 @@ private:
         }
     }
 
+    // A value's dependence on the unique input bits of this block.
+    // identity means value bit i is input bit (identBase + i), so a constant
+    // select can shrink the mask. Anything that mixes bits clears identity
+    // and keeps the union, which is still a conservative support.
+    struct ExprBits final {
+        uint64_t mask = 0;
+        bool identity = false;
+        int identBase = 0;
+        int width = 0;
+    };
+
+    struct InBit final {
+        AstVarScope* vscp;
+        int local;
+    };
+
+    bool sliceCandidate() const {
+        if (m_why.find("too much space") == string::npos
+            && m_why.find("bad tradeoff") == string::npos) {
+            return false;
+        }
+        if (m_outVarps.empty() || m_inVarps.empty()) return false;
+        return true;
+    }
+
+    ExprBits* exprBits(AstNode* nodep, const std::unordered_map<AstVarScope*, int>& base,
+                       int nBits, ExprBits& storage) {
+        storage = {};
+        if (!nodep || VN_IS(nodep, Const)) return &storage;
+        if (AstVarRef* const refp = VN_CAST(nodep, VarRef)) {
+            if (!refp->access().isReadOrRW()) return &storage;
+            const auto it = base.find(refp->varScopep());
+            if (it == base.end()) return nullptr;
+            const int width = refp->varp()->width();
+            if (it->second < 0 || width <= 0 || it->second + width > nBits || nBits > 64) {
+                return nullptr;
+            }
+            storage.identity = true;
+            storage.identBase = it->second;
+            storage.width = width;
+            storage.mask = width >= 64 ? ~0ull : ((1ull << width) - 1) << it->second;
+            return &storage;
+        }
+        if (AstSel* const selp = VN_CAST(nodep, Sel)) {
+            // A select of a zero-extended input is still that input's low bits.
+            AstNode* fromp = selp->fromp();
+            while (VN_IS(fromp, Extend) || VN_IS(fromp, CCast)) {
+                fromp = VN_CAST(fromp, NodeUniop)->lhsp();
+            }
+            ExprBits innerStore;
+            ExprBits* const innerp = exprBits(fromp, base, nBits, innerStore);
+            if (!innerp) return nullptr;
+            if (!innerp->identity || !VN_IS(selp->lsbp(), Const) || !VN_IS(selp->widthp(), Const)) {
+                storage.mask = innerp->mask;
+                return &storage;
+            }
+            const int lsb = selp->lsbConst();
+            const int width = selp->widthConst();
+            if (lsb < 0 || width <= 0 || lsb + width > innerp->width) {
+                storage.mask = innerp->mask;
+                return &storage;
+            }
+            storage.identity = true;
+            storage.identBase = innerp->identBase + lsb;
+            storage.width = width;
+            storage.mask = width >= 64 ? ~0ull : ((1ull << width) - 1) << storage.identBase;
+            return &storage;
+        }
+        if (AstCond* const condp = VN_CAST(nodep, Cond)) {
+            ExprBits aStore;
+            ExprBits bStore;
+            ExprBits cStore;
+            ExprBits* const ap = exprBits(condp->condp(), base, nBits, aStore);
+            ExprBits* const bp = exprBits(condp->thenp(), base, nBits, bStore);
+            ExprBits* const cp = exprBits(condp->elsep(), base, nBits, cStore);
+            if (!ap || !bp || !cp) return nullptr;
+            storage.mask = ap->mask | bp->mask | cp->mask;
+            return &storage;
+        }
+        if (AstNodeBiop* const biop = VN_CAST(nodep, NodeBiop)) {
+            ExprBits lStore;
+            ExprBits rStore;
+            ExprBits* const lp = exprBits(biop->lhsp(), base, nBits, lStore);
+            ExprBits* const rp = exprBits(biop->rhsp(), base, nBits, rStore);
+            if (!lp || !rp) return nullptr;
+            storage.mask = lp->mask | rp->mask;
+            return &storage;
+        }
+        if (AstNodeUniop* const unop = VN_CAST(nodep, NodeUniop)) {
+            ExprBits childStore;
+            ExprBits* const childp = exprBits(unop->lhsp(), base, nBits, childStore);
+            if (!childp) return nullptr;
+            storage.mask = childp->mask;
+            return &storage;
+        }
+        return nullptr;
+    }
+
+    AstVarScope* writtenVar(AstNode* lhsp) {
+        if (AstVarRef* const refp = VN_CAST(lhsp, VarRef)) return refp->varScopep();
+        if (AstSel* const selp = VN_CAST(lhsp, Sel)) return writtenVar(selp->fromp());
+        return nullptr;
+    }
+
+    int outIndexOf(AstVarScope* vscp) const {
+        for (size_t i = 0; i < m_outVarps.size(); ++i) {
+            if (m_outVarps[i].varScopep() == vscp) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // extraMask is the input bits of the conditions that guard this statement.
+    bool walkSupport(AstNode* nodep, uint64_t extraMask,
+                     const std::unordered_map<AstVarScope*, int>& base, int nBits,
+                     std::vector<uint64_t>& support, std::vector<bool>& seen) {
+        for (; nodep; nodep = nodep->nextp()) {
+            if (VN_IS(nodep, Comment) || VN_IS(nodep, Empty)) continue;
+            if (AstBegin* const beginp = VN_CAST(nodep, Begin)) {
+                if (!walkSupport(beginp->stmtsp(), extraMask, base, nBits, support, seen)) {
+                    return false;
+                }
+                continue;
+            }
+            if (AstNodeAssign* const assignp = VN_CAST(nodep, NodeAssign)) {
+                AstVarScope* const vscp = writtenVar(assignp->lhsp());
+                const int idx = vscp ? outIndexOf(vscp) : -1;
+                if (idx < 0) return false;
+                ExprBits store;
+                ExprBits* const rhsp = exprBits(assignp->rhsp(), base, nBits, store);
+                if (!rhsp) return false;
+                support[idx] |= extraMask | rhsp->mask;
+                seen[idx] = true;
+                continue;
+            }
+            if (AstIf* const ifp = VN_CAST(nodep, If)) {
+                ExprBits store;
+                ExprBits* const condp = exprBits(ifp->condp(), base, nBits, store);
+                if (!condp) return false;
+                const uint64_t next = extraMask | condp->mask;
+                if (!walkSupport(ifp->thensp(), next, base, nBits, support, seen)) return false;
+                if (!walkSupport(ifp->elsesp(), next, base, nBits, support, seen)) return false;
+                continue;
+            }
+            if (AstCase* const casep = VN_CAST(nodep, Case)) {
+                ExprBits store;
+                ExprBits* const exprp = exprBits(casep->exprp(), base, nBits, store);
+                if (!exprp) return false;
+                const uint64_t next = extraMask | exprp->mask;
+                for (AstCaseItem* itemp = casep->itemsp(); itemp;
+                     itemp = VN_AS(itemp->nextp(), CaseItem)) {
+                    uint64_t itemMask = next;
+                    for (AstNodeExpr* condp = itemp->condsp(); condp;
+                         condp = VN_AS(condp->nextp(), NodeExpr)) {
+                        ExprBits condStore;
+                        ExprBits* const gotp = exprBits(condp, base, nBits, condStore);
+                        if (!gotp) return false;
+                        itemMask |= gotp->mask;
+                    }
+                    if (!walkSupport(itemp->stmtsp(), itemMask, base, nBits, support, seen)) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // Replace one always with one table per independent input-bit mask.
+    bool trySlice(AstAlways* nodep) {
+        if (!sliceCandidate()) return false;
+
+        std::unordered_map<AstVarScope*, int> base;
+        std::vector<InBit> bitOf;
+        for (AstVarScope* const vscp : m_inVarps) {
+            if (base.count(vscp)) continue;
+            if (outIndexOf(vscp) >= 0) return false;  // Read and written: not a pure input
+            const int width = vscp->width();
+            if (width <= 0 || static_cast<int>(bitOf.size()) + width > 64) return false;
+            base.emplace(vscp, static_cast<int>(bitOf.size()));
+            for (int bit = 0; bit < width; ++bit) bitOf.push_back({vscp, bit});
+        }
+        const int nBits = static_cast<int>(bitOf.size());
+        if (nBits <= 1) return false;
+
+        std::vector<uint64_t> support(m_outVarps.size(), 0);
+        std::vector<bool> seen(m_outVarps.size(), false);
+        if (!walkSupport(nodep->stmtsp(), 0, base, nBits, support, seen)) return false;
+        for (bool wasSeen : seen) {
+            if (!wasSeen) return false;
+        }
+
+        std::map<uint64_t, std::vector<unsigned>> groups;
+        for (unsigned i = 0; i < support.size(); ++i) groups[support[i]].push_back(i);
+
+        struct Slice final {
+            uint64_t mask;
+            std::vector<int> bitPos;  // Global input bits, LSB of the index first
+            std::vector<unsigned> outs;
+            int width = 0;
+            unsigned outBytes = 0;
+        };
+        std::vector<Slice> slices;
+        double space = 0;
+        for (const auto& group : groups) {
+            Slice slice;
+            slice.mask = group.first;
+            slice.outs = group.second;
+            for (int bit = 0; bit < nBits; ++bit) {
+                if (slice.mask & (1ull << bit)) slice.bitPos.push_back(bit);
+            }
+            slice.width = static_cast<int>(slice.bitPos.size());
+            if (slice.width > 16) return false;
+            for (unsigned out : slice.outs) {
+                slice.outBytes += m_outVarps[out].varScopep()->varp()->dtypeSkipRefp()
+                                      ->widthTotalBytes();
+            }
+            const double entries = slice.width == 0 ? 1.0 : std::pow(2.0, slice.width);
+            space += entries * (slice.outBytes + slice.outs.size());
+            slices.push_back(std::move(slice));
+        }
+        const double time = std::max<double>(m_instrs * TABLE_BYTES_PER_INST + m_dataCount, 1);
+        if (space > TABLE_MAX_BYTES || space > time * TABLE_SPACE_TIME_MULT) return false;
+        if (m_totalBytes + space > TABLE_TOTAL_BYTES) return false;
+        // A lone group that still uses every input bit is the table we refused.
+        // A narrower group is a real slice even if it is the only lookup.
+        // Width 0 is a constant assign, not a table.
+        int nReal = 0;
+        int realWidth = 0;
+        for (const Slice& slice : slices) {
+            if (slice.width <= 0) continue;
+            ++nReal;
+            realWidth = slice.width;
+        }
+        if (nReal == 0) return false;
+        if (nReal == 1 && realWidth >= nBits) return false;
+
+        // Simulate every slice before any AST edit. A later failure must not
+        // leave index variables, half-built tables, or inflated stats behind.
+        struct SimSlice final {
+            std::vector<std::vector<V3Number>> values;
+            std::vector<std::vector<bool>> assigned;
+            std::vector<bool> anyHole;
+        };
+        std::vector<SimSlice> sims;
+        sims.reserve(slices.size());
+        {
+            TableSimulateVisitor simvis{this};
+            for (const Slice& slice : slices) {
+                SimSlice sim;
+                sim.values.resize(slice.outs.size());
+                sim.assigned.resize(slice.outs.size());
+                sim.anyHole.assign(slice.outs.size(), false);
+                const uint32_t nIdx = slice.width == 0 ? 1u : (1u << slice.width);
+                for (uint32_t idx = 0; idx < nIdx; ++idx) {
+                    simvis.clear();
+                    std::vector<V3Number> nums;
+                    nums.reserve(base.size());
+                    std::vector<AstVarScope*> vars;
+                    vars.reserve(base.size());
+                    for (const auto& pair : base) {
+                        vars.push_back(pair.first);
+                        nums.emplace_back(pair.first->fileline(), pair.first->width(), 0);
+                    }
+                    for (size_t k = 0; k < slice.bitPos.size(); ++k) {
+                        if ((idx & (1u << k)) == 0) continue;
+                        const InBit& in = bitOf[slice.bitPos[k]];
+                        for (size_t v = 0; v < vars.size(); ++v) {
+                            if (vars[v] == in.vscp) nums[v].setBit(in.local, 1);
+                        }
+                    }
+                    for (size_t v = 0; v < vars.size(); ++v) {
+                        const AstConst cnst{vars[v]->fileline(), nums[v]};
+                        simvis.newValue(vars[v], &cnst);
+                    }
+                    simvis.mainTableEmulate(nodep);
+                    if (!simvis.optimizable()) return false;
+                    for (size_t o = 0; o < slice.outs.size(); ++o) {
+                        TableOutputVar& tov = m_outVarps[slice.outs[o]];
+                        if (V3Number* const outnump
+                            = simvis.fetchOutNumberNull(tov.varScopep())) {
+                            sim.values[o].push_back(*outnump);
+                            sim.assigned[o].push_back(true);
+                        } else {
+                            sim.values[o].emplace_back(nodep, tov.varScopep()->width(), 0);
+                            sim.assigned[o].push_back(false);
+                            sim.anyHole[o] = true;
+                        }
+                    }
+                }
+                sims.push_back(std::move(sim));
+            }
+        }
+
+        FileLine* const fl = nodep->fileline();
+        AstNode* stmtsp = nullptr;
+        const auto append = [&](AstNode* nodep) {
+            if (!nodep) return;
+            stmtsp = stmtsp ? AstNode::addNext(stmtsp, nodep) : nodep;
+        };
+
+        for (size_t s = 0; s < slices.size(); ++s) {
+            Slice& slice = slices[s];
+            SimSlice& sim = sims[s];
+            // Constant support is a direct assign. It is not a lookup table.
+            if (slice.width > 0) {
+                ++m_modTables;
+                ++m_statTablesCre;
+                ++m_statSlices;
+            }
+            const uint32_t nIdx = slice.width == 0 ? 1u : (1u << slice.width);
+            const uint32_t maxIdx = nIdx - 1;
+
+            AstVarScope* indexVscp = nullptr;
+            if (slice.width > 0) {
+                AstVar* const indexVarp
+                    = new AstVar{fl, VVarType::BLOCKTEMP, "__Vtableslc" + cvtToStr(m_modTables),
+                                 VFlagBitPacked{}, slice.width};
+                m_modp->addStmtsp(indexVarp);
+                indexVscp = new AstVarScope{fl, m_scopep, indexVarp};
+                m_scopep->addVarsp(indexVscp);
+                AstNodeExpr* concatp = nullptr;
+                for (int global : slice.bitPos) {
+                    const InBit& in = bitOf[global];
+                    AstSel* const bitp = new AstSel{
+                        fl, new AstVarRef{fl, in.vscp, VAccess::READ}, in.local, 1};
+                    concatp = concatp ? new AstConcat{fl, bitp, concatp}
+                                      : static_cast<AstNodeExpr*>(bitp);
+                }
+                append(new AstAssign{fl, new AstVarRef{fl, indexVscp, VAccess::WRITE}, concatp});
+            }
+
+            for (size_t o = 0; o < slice.outs.size(); ++o) {
+                TableOutputVar& tov = m_outVarps[slice.outs[o]];
+                if (slice.width == 0) {
+                    if (!sim.assigned[o][0]) continue;
+                    AstNodeExpr* const alhsp = new AstVarRef{fl, tov.varScopep(), VAccess::WRITE};
+                    AstNodeExpr* const arhsp = new AstConst{fl, sim.values[o][0]};
+                    append(m_assignDly ? static_cast<AstNode*>(new AstAssignDly{fl, alhsp, arhsp})
+                                       : static_cast<AstNode*>(new AstAssign{fl, alhsp, arhsp}));
+                    continue;
+                }
+                tov.setTableSize(maxIdx);
+                if (sim.anyHole[o]) tov.setMayBeUnassigned();
+                for (uint32_t idx = 0; idx < nIdx; ++idx) tov.addValue(idx, sim.values[o][idx]);
+
+                TableBuilder holeBuilder{fl};
+                AstVarScope* holeVscp = nullptr;
+                if (sim.anyHole[o]) {
+                    holeBuilder.setTableSize(nodep->findBitDType(1, 1, VSigning::UNSIGNED),
+                                             maxIdx);
+                    for (uint32_t idx = 0; idx < nIdx; ++idx) {
+                        if (!sim.assigned[o][idx]) continue;
+                        V3Number one{nodep, 1, 1};
+                        holeBuilder.addValue(idx, one);
+                    }
+                    holeVscp = holeBuilder.varScopep();
+                }
+
+                AstNodeExpr* const alhsp = new AstVarRef{fl, tov.varScopep(), VAccess::WRITE};
+                AstNodeExpr* const arhsp = select(fl, tov.tabeVarScopep(), indexVscp);
+                AstNode* outsetp = m_assignDly
+                                       ? static_cast<AstNode*>(new AstAssignDly{fl, alhsp, arhsp})
+                                       : static_cast<AstNode*>(new AstAssign{fl, alhsp, arhsp});
+                if (holeVscp) outsetp = new AstIf{fl, select(fl, holeVscp, indexVscp), outsetp};
+                append(outsetp);
+            }
+        }
+
+        m_totalBytes += space;
+        UINFO(3, " Table slices " << slices.size() << " spacetime=" << (space / time) << " "
+                                  << nodep << endl);
+        nodep->stmtsp()->unlinkFrBackWithNext()->deleteTree();
+        nodep->addStmtsp(stmtsp);
+        return true;
+    }
+
     // VISITORS
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
     void visit(AstNodeModule* nodep) override {
@@ -401,6 +791,8 @@ private:
         if (treeTest(nodep)) {
             // Well, then, I'll be a memory hog.
             replaceWithTable(nodep);
+        } else if (trySlice(nodep)) {
+            // Wide input, independent fields. Each field is its own table.
         }
     }
     void visit(AstNodeAssign* nodep) override {
@@ -414,6 +806,7 @@ public:
     explicit TableVisitor(AstNetlist* nodep) { iterate(nodep); }
     ~TableVisitor() override {  //
         V3Stats::addStat("Optimizations, Tables created", m_statTablesCre);
+        V3Stats::addStat("Optimizations, Table slices", m_statSlices);
     }
 };
 

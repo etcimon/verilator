@@ -1202,6 +1202,12 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-fmerge-cond-motion", FOnOff, &m_fMergeCondMotion);
     DECL_OPTION("-fmerge-const-pool", FOnOff, &m_fMergeConstPool);
     DECL_OPTION("-freloop", FOnOff, &m_fReloop);
+    DECL_OPTION("-fprio", FOnOff, &m_fPrio);
+    DECL_OPTION("-fsoa", FOnOff, &m_fSoa);
+    DECL_OPTION("-fwake", FOnOff, &m_fWake);
+    DECL_OPTION("-fclock-skip", FOnOff, &m_fClockSkip);
+    DECL_OPTION("-fsplit-plan", FOnOff, &m_fSplitPlan);
+    DECL_OPTION("-fdirty", FOnOff, &m_fDirty);
     DECL_OPTION("-freorder", FOnOff, &m_fReorder);
     DECL_OPTION("-fsplit", FOnOff, &m_fSplit);
     DECL_OPTION("-fsubst", FOnOff, &m_fSubst);
@@ -1976,6 +1982,12 @@ void V3Options::optimize(int level) {
     m_fLocalize = flag;
     m_fMergeCond = flag;
     m_fReloop = flag;
+    m_fPrio = flag;
+    m_fSoa = flag;
+    m_fWake = flag;
+    m_fClockSkip = flag;
+    m_fSplitPlan = flag;
+    m_fDirty = flag;
     m_fReorder = flag;
     m_fSplit = flag;
     m_fSubst = flag;

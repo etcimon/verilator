@@ -456,6 +456,7 @@ public:
         SCOPEPTR,
         CHARPTR,
         MTASKSTATE,
+        MTASKMASK,
         TRIGGERVEC,
         DELAY_SCHEDULER,
         TRIGGER_SCHEDULER,
@@ -488,6 +489,7 @@ public:
                                             "VerilatedScope*",
                                             "char*",
                                             "VlMTaskState",
+                                            "VlMTaskMask",
                                             "VlTriggerVec",
                                             "VlDelayScheduler",
                                             "VlTriggerScheduler",
@@ -504,7 +506,8 @@ public:
             = {"%E-unk",       "svBit",         "char",          "void*",        "char",
                "int",          "%E-integer",    "svLogic",       "long long",    "double",
                "short",        "%E-time",       "const char*",   "%E-untyped",   "dpiScope",
-               "const char*",  "%E-mtaskstate", "%E-triggervec", "%E-dly-sched", "%E-trig-sched",
+               "const char*",  "%E-mtaskstate", "%E-mtaskmask", "%E-triggervec", "%E-dly-sched",
+               "%E-trig-sched",
                "%E-dyn-sched", "%E-fork",       "IData",         "QData",        "%E-logic-implct",
                " MAX"};
         return names[m_e];
@@ -540,6 +543,7 @@ public:
         case SCOPEPTR: return 0;  // opaque
         case CHARPTR: return 0;  // opaque
         case MTASKSTATE: return 0;  // opaque
+        case MTASKMASK: return 0;  // opaque
         case TRIGGERVEC: return 0;  // opaque
         case DELAY_SCHEDULER: return 0;  // opaque
         case TRIGGER_SCHEDULER: return 0;  // opaque
@@ -582,7 +586,8 @@ public:
     }
     bool isOpaque() const VL_MT_SAFE {  // IE not a simple number we can bit optimize
         return (m_e == EVENT || m_e == STRING || m_e == SCOPEPTR || m_e == CHARPTR
-                || m_e == MTASKSTATE || m_e == TRIGGERVEC || m_e == DELAY_SCHEDULER
+                || m_e == MTASKSTATE || m_e == MTASKMASK || m_e == TRIGGERVEC
+                || m_e == DELAY_SCHEDULER
                 || m_e == TRIGGER_SCHEDULER || m_e == DYNAMIC_TRIGGER_SCHEDULER || m_e == FORK_SYNC
                 || m_e == DOUBLE || m_e == UNTYPED);
     }
@@ -590,6 +595,7 @@ public:
     bool isEvent() const { return m_e == EVENT; }
     bool isString() const VL_MT_SAFE { return m_e == STRING; }
     bool isMTaskState() const VL_MT_SAFE { return m_e == MTASKSTATE; }
+    bool isMTaskMask() const VL_MT_SAFE { return m_e == MTASKMASK; }
     // Does this represent a C++ LiteralType? (can be constexpr)
     bool isLiteralType() const VL_MT_SAFE {
         switch (m_e) {

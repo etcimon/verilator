@@ -366,6 +366,12 @@ private:
     bool m_fMergeCondMotion = true; // main switch: -fno-merge-cond-motion: perform code motion
     bool m_fMergeConstPool = true;  // main switch: -fno-merge-const-pool
     bool m_fReloop;      // main switch: -fno-reloop: reform loops
+    bool m_fPrio = true;  // main switch: -fno-prio: ctz lowering of lzc / grant
+    bool m_fSoa = true;  // main switch: -fno-soa: element tables for packed arrays
+    bool m_fWake = true;  // main switch: -fno-wake: inverted tag wakeup table
+    bool m_fClockSkip = true;  // main switch: -fno-clock-skip: skip stable instance combo
+    bool m_fSplitPlan = true;  // main switch: -fno-split-plan: auto split_var on combo cycles
+    bool m_fDirty = true;  // main switch: -fno-dirty: dirty-bit hybrid triggers
     bool m_fReorder;     // main switch: -fno-reorder: reorder assignments in blocks
     bool m_fSplit;       // main switch: -fno-split: always assignment splitting
     bool m_fSubst;       // main switch: -fno-subst: substitute expression temp values
@@ -622,6 +628,12 @@ public:
     bool fMergeCondMotion() const { return m_fMergeCondMotion; }
     bool fMergeConstPool() const { return m_fMergeConstPool; }
     bool fReloop() const { return m_fReloop; }
+    bool fPrio() const { return m_fPrio; }
+    bool fSoa() const { return m_fSoa; }
+    bool fWake() const { return m_fWake; }
+    bool fClockSkip() const { return m_fClockSkip; }
+    bool fSplitPlan() const { return m_fSplitPlan; }
+    bool fDirty() const { return m_fDirty; }
     bool fReorder() const { return m_fReorder; }
     bool fSplit() const { return m_fSplit; }
     bool fSubst() const { return m_fSubst; }

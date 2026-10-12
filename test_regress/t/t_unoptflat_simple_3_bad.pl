@@ -14,7 +14,8 @@ top_filename("t/t_unoptflat_simple_3.v");
 
 # Compile only
 compile(
-    fails => 1
+    fails => 1,
+    verilator_flags2 => ["-fno-split-plan"],
     );
 
 ok(1);

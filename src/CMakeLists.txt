@@ -49,6 +49,8 @@ set(HEADERS
     V3CCtors.h
     V3Class.h
     V3Clean.h
+    V3ClkSkip.h
+    V3Dirty.h
     V3Clock.h
     V3Combine.h
     V3Common.h
@@ -140,6 +142,7 @@ set(HEADERS
     V3Simulate.h
     V3Slice.h
     V3Split.h
+    V3SplitPlan.h
     V3SplitAs.h
     V3SplitVar.h
     V3Stats.h
@@ -188,6 +191,8 @@ set(COMMON_SOURCES
     V3Cast.cpp
     V3Class.cpp
     V3Clean.cpp
+    V3ClkSkip.cpp
+    V3Dirty.cpp
     V3Clock.cpp
     V3Combine.cpp
     V3Common.cpp
@@ -273,7 +278,10 @@ set(COMMON_SOURCES
     V3Scope.cpp
     V3Scoreboard.cpp
     V3Slice.cpp
+    V3Prio.cpp
+    V3Soa.cpp
     V3Split.cpp
+    V3SplitPlan.cpp
     V3SplitAs.cpp
     V3SplitVar.cpp
     V3Stats.cpp
@@ -292,6 +300,7 @@ set(COMMON_SOURCES
     V3Unroll.cpp
     V3VariableOrder.cpp
     V3Waiver.cpp
+    V3Wake.cpp
     V3Width.cpp
     V3WidthSel.cpp
     V3ParseImp.cpp

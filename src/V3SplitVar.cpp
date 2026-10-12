@@ -231,6 +231,11 @@ struct SplitVarImpl {
 // Utilities required in various placs
 
 static void warnNoSplit(const AstVar* varp, const AstNode* wherep, const char* reasonp) {
+    // SplitPlan marks every splittable variable in a combinational cycle and
+    // does not run again. Dropping a refused variable and retrying is not
+    // monotone: neighbors that did split can come back together. Stay quiet
+    // for those automatic marks; a user metacomment still warns.
+    if (varp->attrSplitAuto()) return;
     wherep->v3warn(SPLITVAR, varp->prettyNameQ()
                                  << " has split_var metacomment but will not be split because "
                                  << reasonp << ".\n");

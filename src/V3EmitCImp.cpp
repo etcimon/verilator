@@ -410,7 +410,10 @@ class EmitCImp final : EmitCFunc {
                             }
                             const AstBasicDType* const basicp = elementp->basicp();
                             // Do not save MTask state, only matters within an evaluation
-                            if (basicp && basicp->keyword().isMTaskState()) continue;
+                            if (basicp
+                                && (basicp->keyword().isMTaskState()
+                                    || basicp->keyword().isMTaskMask()))
+                                continue;
                             // Want to detect types that are represented as arrays
                             // (i.e. packed types of more than 64 bits).
                             if (elementp->isWide()

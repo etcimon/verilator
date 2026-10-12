@@ -762,6 +762,8 @@ AstNodeDType::CTypeRecursed AstNodeDType::cTypeRecurse(bool compound) const {
             info.m_type = "std::string";
         } else if (bdtypep->keyword().isMTaskState()) {
             info.m_type = "VlMTaskVertex";
+        } else if (bdtypep->keyword().isMTaskMask()) {
+            info.m_type = "VlMTaskDoneMask";
         } else if (bdtypep->isTriggerVec()) {
             info.m_type = "VlTriggerVec<" + cvtToStr(dtypep->width()) + ">";
         } else if (bdtypep->isDelayScheduler()) {

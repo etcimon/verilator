@@ -21,6 +21,8 @@
 #include "verilatedos.h"
 
 #include "V3Ast.h"
+#include "V3Global.h"
+#include "V3Stats.h"
 #include "V3UniqueNames.h"
 
 //######################################################################
@@ -40,6 +42,10 @@ class SenExprBuilder final {
     std::unordered_map<VNRef<AstNode>, AstVarScope*> m_curr;  // The 'current value' signals
     std::unordered_map<VNRef<AstNode>, AstVarScope*> m_changed;  // The 'value changed' flags of
                                                                  // wide change-detected signals
+    std::unordered_map<VNRef<AstNode>, AstVarScope*> m_dirtyPrev;  // Previous value for a dirty
+                                                                   // hybrid sensitivity
+    std::unordered_map<VNRef<AstNode>, AstVarScope*> m_dirtyChg;  // Compare result for that
+                                                                  // sensitivity
     std::unordered_set<VNRef<AstNode>> m_hasPreUpdate;  // Whether the given sen expression already
                                                         // has an update statement in m_preUpdates
     std::unordered_set<VNRef<AstNode>> m_hasPostUpdate;  // Likewise for m_postUpdates
@@ -48,6 +54,7 @@ class SenExprBuilder final {
                                                    // signal names
     V3UniqueNames m_prevNames{"__Vtrigprevexpr"};  // Likewise for previous values
     V3UniqueNames m_chgNames{"__Vtrigchgexpr"};  // Likewise for 'changed' flags
+    int m_dirtySeq = 0;  // Unique suffix for dirty-bit state variables
 
     // Wide packed signals under change detection: compare once into a flag, and copy
     // the previous value only when the flag is set. The unconditional copy was a full
@@ -201,6 +208,136 @@ class SenExprBuilder final {
         return chgp;
     }
 
+    // Wide hybrid cuts compare one dirty bit per 32-bit word instead of the
+    // vector. The bit is a level, sampled into the trigger vector before the
+    // post-update clears it. It is not itself change-detected: clearing it
+    // would otherwise schedule a second pass. Returns null when this
+    // sensitivity must keep the value compare (a primary input, a public or
+    // forced or DPI-written signal, a narrow value, an unpacked array).
+    AstNodeExpr* dirtyTerm(AstNodeExpr* senp) {
+        if (!v3Global.opt.fDirty()) return nullptr;
+        AstVarScope* vscp = nullptr;
+        int lsb = 0;
+        int width = 0;
+        if (AstVarRef* const refp = VN_CAST(senp, VarRef)) {
+            vscp = refp->varScopep();
+            lsb = 0;
+            width = refp->varp()->width();
+        } else if (AstSel* const selp = VN_CAST(senp, Sel)) {
+            AstVarRef* const refp = VN_CAST(selp->fromp(), VarRef);
+            if (!refp || !VN_IS(selp->lsbp(), Const) || !VN_IS(selp->widthp(), Const)) {
+                return nullptr;
+            }
+            vscp = refp->varScopep();
+            lsb = selp->lsbConst();
+            width = selp->widthConst();
+        } else {
+            return nullptr;
+        }
+        if (!vscp || width <= 0) return nullptr;
+        AstVar* const varp = vscp->varp();
+        if (varp->width() <= VL_QUADSIZE) return nullptr;
+        AstNodeDType* const dtypep = varp->dtypep() ? varp->dtypep()->skipRefp() : nullptr;
+        if (!dtypep || !dtypep->isIntegralOrPacked()) return nullptr;
+        if (VN_IS(dtypep, UnpackArrayDType)) return nullptr;
+        // A store the generated model does not perform would never set the
+        // bit. Those signals keep the value compare.
+        if (varp->isSigPublic() || varp->isForceable() || varp->isWrittenByDpi()) return nullptr;
+        if (varp->isPrimaryInish() || varp->isWrittenBySuspendable()) return nullptr;
+        if (varp->direction() == VDirection::INOUT) return nullptr;
+
+        FileLine* const flp = senp->fileline();
+        if (!vscp->dirtyWordsp()) {
+            const int nWords = (varp->width() + 31) / 32;
+            string base = vscp->name();
+            for (char& c : base) {
+                const unsigned char u = static_cast<unsigned char>(c);
+                const bool ok = (u >= '0' && u <= '9') || (u >= 'A' && u <= 'Z')
+                                || (u >= 'a' && u <= 'z');
+                if (!ok) c = '_';
+            }
+            base += "_" + cvtToStr(++m_dirtySeq);
+            AstVarScope* const wordsp = m_scopep->createTemp("__Vdirtyw_" + base, nWords);
+            AstVarScope* const allp = m_scopep->createTemp("__Vdirtya_" + base, 1);
+            for (AstVarScope* const createdp : {wordsp, allp}) {
+                createdp->trace(false);
+                createdp->varp()->trace(false);
+                createdp->varp()->noSubst(true);
+            }
+            vscp->dirtyWordsp(wordsp);
+            vscp->dirtyAllp(allp);
+            V3Stats::addStat("Optimizations, Dirty-bit signals", 1);
+        }
+
+        AstVarScope* const wordsp = vscp->dirtyWordsp();
+        AstVarScope* const allp = vscp->dirtyAllp();
+        const int nWords = wordsp->width();
+        int w0 = lsb >> 5;
+        int w1 = (lsb + width - 1) >> 5;
+        if (w0 < 0) w0 = 0;
+        if (w1 >= nWords) w1 = nWords - 1;
+        if (w1 < w0) w1 = w0;
+        const auto dirtyLevel = [&]() {
+            AstSel* const bitselp = new AstSel{flp, new AstVarRef{flp, wordsp, VAccess::READ}, w0,
+                                                w1 - w0 + 1};
+            return new AstLogOr{flp, new AstVarRef{flp, allp, VAccess::READ},
+                                new AstRedOr{flp, bitselp}};
+        };
+
+        // A store sets the bit even when a later store in the same pass puts
+        // the old value back. The trigger still compares, but only if a bit
+        // is set, and it compares the value after the whole pass. A stable
+        // value does not schedule another pass. No store means no compare.
+        auto prevIt = m_dirtyPrev.find(*senp);
+        if (prevIt == m_dirtyPrev.end()) {
+            const string base = "__Vdirtyprev_" + cvtToStr(++m_dirtySeq);
+            AstVarScope* const createdp = m_scopep->createTemp(base, senp->dtypep());
+            createdp->trace(false);
+            createdp->varp()->trace(false);
+            createdp->varp()->noSubst(true);
+            prevIt = m_dirtyPrev.emplace(*senp, createdp).first;
+        }
+        auto chgIt = m_dirtyChg.find(*senp);
+        if (chgIt == m_dirtyChg.end()) {
+            const string base = "__Vdirtychg_" + cvtToStr(++m_dirtySeq);
+            AstVarScope* const createdp = m_scopep->createTemp(base, 1);
+            createdp->trace(false);
+            createdp->varp()->trace(false);
+            createdp->varp()->noSubst(true);
+            chgIt = m_dirtyChg.emplace(*senp, createdp).first;
+        }
+        AstVarScope* const prevp = prevIt->second;
+        AstVarScope* const chgp = chgIt->second;
+
+        if (m_hasPreUpdate.emplace(*chgp).second) {
+            AstNeq* const neqp = new AstNeq{flp, senp->cloneTree(false),
+                                            new AstVarRef{flp, prevp, VAccess::READ}};
+            AstAssign* const setp
+                = new AstAssign{flp, new AstVarRef{flp, chgp, VAccess::WRITE}, neqp};
+            AstAssign* const clrp = new AstAssign{flp, new AstVarRef{flp, chgp, VAccess::WRITE},
+                                                  new AstConst{flp, AstConst::BitTrue{}, false}};
+            m_preUpdates.push_back(new AstIf{flp, dirtyLevel(), setp, clrp});
+        }
+        if (m_hasPostUpdate.emplace(*chgp).second) {
+            AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, chgp, VAccess::READ}};
+            ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, prevp, VAccess::WRITE},
+                                         senp->cloneTree(false)});
+            m_postUpdates.push_back(ifp);
+        }
+        // Clear after the trigger bit has been sampled. Settle, input-combo,
+        // and active each get their own clear. The dirty bit is not itself
+        // change-detected, so the 1-to-0 clear does not schedule a pass.
+        if (m_hasPostUpdate.emplace(*wordsp).second) {
+            AstConst* const zerop = new AstConst{flp, AstConst::DTyped{}, wordsp->dtypep()};
+            m_postUpdates.push_back(new AstAssign{
+                flp, new AstVarRef{flp, wordsp, VAccess::WRITE}, zerop});
+            m_postUpdates.push_back(new AstAssign{
+                flp, new AstVarRef{flp, allp, VAccess::WRITE},
+                new AstConst{flp, AstConst::BitTrue{}, false}});
+        }
+        return new AstVarRef{flp, chgp, VAccess::READ};
+    }
+
     std::pair<AstNodeExpr*, bool> createTerm(AstSenItem* senItemp) {
         FileLine* const flp = senItemp->fileline();
         AstNodeExpr* const senp = senItemp->sensp();
@@ -215,6 +352,9 @@ class SenExprBuilder final {
             return {nullptr, false};  // We already warn for this in V3LinkResolve
         case VEdgeType::ET_CHANGED:
         case VEdgeType::ET_HYBRID:  //
+            if (senItemp->edgeType() == VEdgeType::ET_HYBRID) {
+                if (AstNodeExpr* const dirtyp = dirtyTerm(senp)) return {dirtyp, true};
+            }
             if (VN_IS(senp->dtypep(), UnpackArrayDType)) {
                 AstCMethodHard* const resultp = new AstCMethodHard{flp, currp(), "neq", prevp()};
                 resultp->dtypeSetBit();

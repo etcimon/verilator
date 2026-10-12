@@ -166,6 +166,7 @@ RAW_OBJS = \
 	V3Cast.o \
 	V3Class.o \
 	V3Clean.o \
+	V3ClkSkip.o \
 	V3Clock.o \
 	V3Combine.o \
 	V3Common.o \
@@ -178,6 +179,7 @@ RAW_OBJS = \
 	V3Depth.o \
 	V3DepthBlock.o \
 	V3Descope.o \
+	V3Dirty.o \
 	V3Dfg.o \
 	V3DfgAstToDfg.o \
 	V3DfgDecomposition.o \
@@ -254,7 +256,10 @@ RAW_OBJS = \
 	V3Scope.o \
 	V3Scoreboard.o \
 	V3Slice.o \
+	V3Prio.o \
+	V3Soa.o \
 	V3Split.o \
+	V3SplitPlan.o \
 	V3SplitAs.o \
 	V3SplitVar.o \
 	V3Stats.o \
@@ -274,6 +279,7 @@ RAW_OBJS = \
 	V3Unroll.o \
 	V3VariableOrder.o \
 	V3Waiver.o \
+	V3Wake.o \
 	V3Width.o \
 	V3WidthSel.o \
 

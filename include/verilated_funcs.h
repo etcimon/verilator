@@ -756,31 +756,142 @@ static inline IData VL_ONEHOT0_W(int words, WDataInP const lwp) VL_PURE {
     return 1;
 }
 
-static inline IData VL_CLOG2_I(IData lhs) VL_PURE {
-    // There are faster algorithms, or fls GCC4 builtins, but rarely used
+// Index of the most-significant set bit. v must be non-zero.
+// O(1): one clz, or a 5-step binary search on hosts without the builtin.
+static inline int VL_CLZ_I(IData v) VL_PURE {
+#if defined(__GNUC__) && !defined(VL_NO_BUILTINS)
+    return __builtin_clz(v);
+#else
+    int n = 0;
+    if ((v & 0xffff0000) == 0) {
+        n += 16;
+        v <<= 16;
+    }
+    if ((v & 0xff000000) == 0) {
+        n += 8;
+        v <<= 8;
+    }
+    if ((v & 0xf0000000) == 0) {
+        n += 4;
+        v <<= 4;
+    }
+    if ((v & 0xc0000000) == 0) {
+        n += 2;
+        v <<= 2;
+    }
+    if ((v & 0x80000000) == 0) n += 1;
+    return n;
+#endif
+}
+// Lowest set bit. 0 when lhs is 0, so a priority encoder is
+// `lhs ? VL_CTZ_*(lhs) : none`.
+static inline IData VL_CTZ_I(IData lhs) VL_PURE {
     if (VL_UNLIKELY(!lhs)) return 0;
-    --lhs;
-    int shifts = 0;
-    for (; lhs != 0; ++shifts) lhs = lhs >> 1;
-    return shifts;
+#if defined(__GNUC__) && !defined(VL_NO_BUILTINS)
+    return __builtin_ctz(lhs);
+#else
+    IData n = 0;
+    if ((lhs & 0xffff) == 0) {
+        n += 16;
+        lhs >>= 16;
+    }
+    if ((lhs & 0xff) == 0) {
+        n += 8;
+        lhs >>= 8;
+    }
+    if ((lhs & 0xf) == 0) {
+        n += 4;
+        lhs >>= 4;
+    }
+    if ((lhs & 0x3) == 0) {
+        n += 2;
+        lhs >>= 2;
+    }
+    if ((lhs & 0x1) == 0) n += 1;
+    return n;
+#endif
+}
+static inline IData VL_CTZ_Q(QData lhs) VL_PURE {
+    if (VL_UNLIKELY(!lhs)) return 0;
+#if defined(__GNUC__) && !defined(VL_NO_BUILTINS)
+    return __builtin_ctzll(lhs);
+#else
+    const IData lo = static_cast<IData>(lhs);
+    if (lo) return VL_CTZ_I(lo);
+    return 32 + VL_CTZ_I(static_cast<IData>(lhs >> 32));
+#endif
+}
+static inline IData VL_CTZ_W(int words, WDataInP const lwp) VL_PURE {
+    for (int i = 0; i < words; ++i) {
+        if (VL_UNLIKELY(lwp[i])) return i * VL_EDATASIZE + VL_CTZ_I(lwp[i]);
+    }
+    return 0;
+}
+// Trailing-zero count used by lzc / priority encoders.
+// v == 0 yields emptyVal (the pulp lzc tree yields WIDTH-1).
+// Evaluating the function on zero is defined, so it is safe inside a
+// conditional that the emitter evaluates eagerly.
+static inline IData VL_LZC_CTZ_I(IData v, IData emptyVal) VL_PURE {
+    return v ? VL_CTZ_I(v) : emptyVal;
+}
+static inline IData VL_LZC_CTZ_Q(QData v, IData emptyVal) VL_PURE {
+    return v ? VL_CTZ_Q(v) : emptyVal;
+}
+// Leading-zero count within a 'width'-bit field held in the low bits.
+// v == 0 yields width-1, matching lzc MODE=1 on an all-zero input.
+static inline IData VL_LZC_CLZ_I(IData v, IData width) VL_PURE {
+    if (VL_UNLIKELY(!v || !width)) return width ? width - 1 : 0;
+    return static_cast<IData>(VL_CLZ_I(v) - (32 - static_cast<int>(width)));
+}
+static inline int VL_CLZ_Q(QData v) VL_PURE {
+#if defined(__GNUC__) && !defined(VL_NO_BUILTINS)
+    return __builtin_clzll(v);
+#else
+    const IData hi = static_cast<IData>(v >> 32);
+    if (hi) return VL_CLZ_I(hi);
+    return 32 + VL_CLZ_I(static_cast<IData>(v));
+#endif
+}
+static inline IData VL_LZC_CLZ_Q(QData v, IData width) VL_PURE {
+    if (VL_UNLIKELY(!v || !width)) return width ? width - 1 : 0;
+    return static_cast<IData>(VL_CLZ_Q(v) - (64 - static_cast<int>(width)));
+}
+// Lowest set bit as a one-hot mask. Zero stays zero (no request, no grant).
+static inline IData VL_LSBONEHOT_I(IData v) VL_PURE { return v & (~v + 1); }
+static inline QData VL_LSBONEHOT_Q(QData v) VL_PURE { return v & (~v + 1); }
+
+static inline IData VL_CLOG2_I(IData lhs) VL_PURE {
+    // $clog2(0) == 0, $clog2(1) == 0, else floor(log2(lhs-1))+1
+    if (VL_UNLIKELY(lhs <= 1)) return 0;
+    return static_cast<IData>(32 - VL_CLZ_I(lhs - 1));
 }
 static inline IData VL_CLOG2_Q(QData lhs) VL_PURE {
-    if (VL_UNLIKELY(!lhs)) return 0;
-    --lhs;
-    int shifts = 0;
-    for (; lhs != 0; ++shifts) lhs = lhs >> 1ULL;
-    return shifts;
+    if (VL_UNLIKELY(lhs <= 1)) return 0;
+#if defined(__GNUC__) && !defined(VL_NO_BUILTINS)
+    return static_cast<IData>(64 - __builtin_clzll(lhs - 1));
+#else
+    const QData v = lhs - 1;
+    const IData hi = static_cast<IData>(v >> 32);
+    if (hi) return static_cast<IData>(32 + (32 - VL_CLZ_I(hi)));
+    return static_cast<IData>(32 - VL_CLZ_I(static_cast<IData>(v)));
+#endif
 }
 static inline IData VL_CLOG2_W(int words, WDataInP const lwp) VL_PURE {
-    const EData adjust = (VL_COUNTONES_W(words, lwp) == 1) ? 0 : 1;
     for (int i = words - 1; i >= 0; --i) {
-        if (VL_UNLIKELY(lwp[i])) {  // Shorter worst case if predict not taken
-            for (int bit = VL_EDATASIZE - 1; bit >= 0; --bit) {
-                if (VL_UNLIKELY(VL_BITISSET_E(lwp[i], bit))) {
-                    return i * VL_EDATASIZE + bit + adjust;
+        if (VL_UNLIKELY(lwp[i])) {
+            const int bit = VL_EDATASIZE - 1 - VL_CLZ_I(lwp[i]);
+            const int pos = i * VL_EDATASIZE + bit;
+            // $clog2(2**k) == k; any other value rounds up.
+            bool pow2 = (lwp[i] & (lwp[i] - 1)) == 0;
+            if (pow2) {
+                for (int j = 0; j < i; ++j) {
+                    if (lwp[j]) {
+                        pow2 = false;
+                        break;
+                    }
                 }
             }
-            // Can't get here - one bit must be set
+            return pos + (pow2 ? 0 : 1);
         }
     }
     return 0;
@@ -789,11 +900,8 @@ static inline IData VL_CLOG2_W(int words, WDataInP const lwp) VL_PURE {
 static inline IData VL_MOSTSETBITP1_W(int words, WDataInP const lwp) VL_PURE {
     // MSB set bit plus one; similar to FLS.  0=value is zero
     for (int i = words - 1; i >= 0; --i) {
-        if (VL_UNLIKELY(lwp[i])) {  // Shorter worst case if predict not taken
-            for (int bit = VL_EDATASIZE - 1; bit >= 0; --bit) {
-                if (VL_UNLIKELY(VL_BITISSET_E(lwp[i], bit))) return i * VL_EDATASIZE + bit + 1;
-            }
-            // Can't get here - one bit must be set
+        if (VL_UNLIKELY(lwp[i])) {
+            return i * VL_EDATASIZE + (VL_EDATASIZE - 1 - VL_CLZ_I(lwp[i])) + 1;
         }
     }
     return 0;

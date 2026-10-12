@@ -1624,6 +1624,7 @@ class AstVar final : public AstNode {
     bool m_usedClock : 1;  // Signal used as a clock
     bool m_usedParam : 1;  // Parameter is referenced (on link; later signals not setup)
     bool m_usedLoopIdx : 1;  // Variable subject of for unrolling
+    bool m_soaNoUnroll : 1;  // Loop index of a SoA table scan; do not unroll
     bool m_usedVirtIface : 1;  // Signal used through a virtual interface
     bool m_funcLocal : 1;  // Local variable for a function
     bool m_funcReturn : 1;  // Return variable for a function
@@ -1631,6 +1632,7 @@ class AstVar final : public AstNode {
     bool m_attrIsolateAssign : 1;  // User isolate_assignments attribute
     bool m_attrSFormat : 1;  // User sformat attribute
     bool m_attrSplitVar : 1;  // declared with split_var metacomment
+    bool m_attrSplitAuto : 1;  // split_var was added by SplitPlan, not a user comment
     bool m_fileDescr : 1;  // File descriptor
     bool m_isRand : 1;  // Random variable
     bool m_isConst : 1;  // Table contains constant data
@@ -1663,6 +1665,7 @@ class AstVar final : public AstNode {
         m_usedClock = false;
         m_usedParam = false;
         m_usedLoopIdx = false;
+        m_soaNoUnroll = false;
         m_usedVirtIface = false;
         m_sigPublic = false;
         m_sigModPublic = false;
@@ -1674,6 +1677,7 @@ class AstVar final : public AstNode {
         m_attrIsolateAssign = false;
         m_attrSFormat = false;
         m_attrSplitVar = false;
+        m_attrSplitAuto = false;
         m_fileDescr = false;
         m_isRand = false;
         m_isConst = false;
@@ -1809,6 +1813,7 @@ public:
     void attrIsolateAssign(bool flag) { m_attrIsolateAssign = flag; }
     void attrSFormat(bool flag) { m_attrSFormat = flag; }
     void attrSplitVar(bool flag) { m_attrSplitVar = flag; }
+    void attrSplitAuto(bool flag) { m_attrSplitAuto = flag; }
     void usedClock(bool flag) { m_usedClock = flag; }
     void usedParam(bool flag) { m_usedParam = flag; }
     void usedLoopIdx(bool flag) { m_usedLoopIdx = flag; }
@@ -1896,6 +1901,8 @@ public:
     bool isUsedClock() const { return m_usedClock; }
     bool isUsedParam() const { return m_usedParam; }
     bool isUsedLoopIdx() const { return m_usedLoopIdx; }
+    bool soaNoUnroll() const { return m_soaNoUnroll; }
+    void soaNoUnroll(bool flag) { m_soaNoUnroll = flag; }
     bool isUsedVirtIface() const { return m_usedVirtIface; }
     bool isSc() const VL_MT_SAFE { return m_sc; }
     bool isScQuad() const;
@@ -1921,6 +1928,7 @@ public:
     bool attrScClocked() const { return m_scClocked; }
     bool attrSFormat() const { return m_attrSFormat; }
     bool attrSplitVar() const { return m_attrSplitVar; }
+    bool attrSplitAuto() const { return m_attrSplitAuto; }
     bool attrIsolateAssign() const { return m_attrIsolateAssign; }
     VVarAttrClocker attrClocker() const { return m_attrClocker; }
     string verilogKwd() const override;
@@ -1971,6 +1979,11 @@ class AstVarScope final : public AstNode {
 private:
     AstScope* m_scopep;  // Scope variable is underneath
     AstVar* m_varp;  // [AfterLink] Pointer to variable itself
+    // Dirty-bit change detect for a wide hybrid cut. One bit per 32-bit word,
+    // plus a single bit set by a whole-variable or dynamic-index store.
+    // Null when this signal is still compared by value.
+    AstVarScope* m_dirtyWordsp = nullptr;
+    AstVarScope* m_dirtyAllp = nullptr;
     bool m_trace : 1;  // Tracing is turned on for this scope
 public:
     AstVarScope(FileLine* fl, AstScope* scopep, AstVar* varp)
@@ -1989,10 +2002,14 @@ public:
             UASSERT(m_scopep->clonep(), "No clone cross link: " << this);
             m_scopep = m_scopep->clonep();
         }
+        if (m_dirtyWordsp && m_dirtyWordsp->clonep()) m_dirtyWordsp = m_dirtyWordsp->clonep();
+        if (m_dirtyAllp && m_dirtyAllp->clonep()) m_dirtyAllp = m_dirtyAllp->clonep();
     }
     const char* broken() const override {
         BROKEN_RTN(m_varp && !m_varp->brokeExists());
         BROKEN_RTN(m_scopep && !m_scopep->brokeExists());
+        BROKEN_RTN(m_dirtyWordsp && !m_dirtyWordsp->brokeExists());
+        BROKEN_RTN(m_dirtyAllp && !m_dirtyAllp->brokeExists());
         return nullptr;
     }
     bool maybePointedTo() const override { return true; }
@@ -2004,6 +2021,10 @@ public:
     void scopep(AstScope* nodep) { m_scopep = nodep; }
     bool isTrace() const { return m_trace; }
     void trace(bool flag) { m_trace = flag; }
+    AstVarScope* dirtyWordsp() const { return m_dirtyWordsp; }
+    void dirtyWordsp(AstVarScope* vscp) { m_dirtyWordsp = vscp; }
+    AstVarScope* dirtyAllp() const { return m_dirtyAllp; }
+    void dirtyAllp(AstVarScope* vscp) { m_dirtyAllp = vscp; }
 };
 
 // === AstNodeBlock ===

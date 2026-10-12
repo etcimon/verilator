@@ -45,16 +45,22 @@ V3DupFinder::size_type V3DupFinder::erase(AstNode* nodep) {
 }
 
 V3DupFinder::iterator V3DupFinder::findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp) {
-    const auto& er = equal_range(m_hasher(nodep));
+    const auto er = equal_range(m_hasher(nodep));
+    iterator best = end();
+    uint64_t bestSeq = ~static_cast<uint64_t>(0);
     for (iterator it = er.first; it != er.second; ++it) {
         AstNode* const node2p = it->second;
         if (nodep == node2p) continue;  // Same node is not a duplicate
         if (checkp && !checkp->isSame(nodep, node2p)) continue;  // User says it is not a duplicate
         if (!nodep->sameTree(node2p)) continue;  // Not the same trees
-        // Found duplicate
-        return it;
+        const auto seqIt = m_order.find(node2p);
+        const uint64_t seq = seqIt == m_order.end() ? 0 : seqIt->second;
+        if (seq < bestSeq) {
+            bestSeq = seq;
+            best = it;
+        }
     }
-    return end();
+    return best;
 }
 
 void V3DupFinder::dumpFile(const string& filename, bool tree) {

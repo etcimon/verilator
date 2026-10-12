@@ -36,6 +36,7 @@
 #include <array>
 #include <list>
 #include <memory>
+#include <sstream>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -3041,8 +3042,59 @@ static void finalizeCosts(V3Graph* execMTaskGraphp) {
     }
 }
 
-static void addMTaskToFunction(const ThreadSchedule& schedule, const uint32_t threadId,
-                               AstCFunc* funcp, const ExecMTask* mtaskp) {
+// Runtime mask width. Must match VlMTaskDoneMask::words().
+constexpr uint32_t MTASK_DONE_WORDS = 16;
+
+static void setMaskBit(std::vector<uint64_t>& words, uint32_t bit) {
+    words.at(bit >> 6) |= (static_cast<uint64_t>(1) << (bit & 63));
+}
+
+static string hexU64(uint64_t value) {
+    std::ostringstream os;
+    os << "0x" << std::hex << value << "ULL";
+    return os.str();
+}
+
+// Even cycle: ready when every predecessor bit is set.
+// Odd cycle: ready when every predecessor bit has been cleared.
+// A zero mask is not a wait. One word is the load-and-AND in the note;
+// wider graphs pass a static array of words.
+static string emitWaitStmt(const string& doneName, const string& evenExpr,
+                           const std::vector<uint64_t>& pred, const string& uniq) {
+    uint32_t highest = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < pred.size(); ++i) {
+        if (!pred[i]) continue;
+        any = true;
+        highest = i;
+    }
+    if (!any) return {};
+    if (highest == 0) {
+        return "vlSelf->" + doneName + ".wait(" + evenExpr + ", " + hexU64(pred[0]) + ");\n";
+    }
+    string stmt = "static const uint64_t __Vm_pred_" + uniq + "[] = {";
+    for (uint32_t i = 0; i <= highest; ++i) {
+        if (i) stmt += ", ";
+        stmt += hexU64(pred[i]);
+    }
+    stmt += "};\nvlSelf->" + doneName + ".wait(" + evenExpr + ", __Vm_pred_" + uniq + ", "
+            + cvtToStr(highest + 1) + ");\n";
+    return stmt;
+}
+
+static std::vector<uint64_t> crossThreadPredMask(const ThreadSchedule& schedule,
+                                                 const ExecMTask* mtaskp, uint32_t nWords) {
+    std::vector<uint64_t> pred(nWords, 0);
+    const uint32_t thisThreadId = schedule.threadId(mtaskp);
+    for (V3GraphEdge* edgep = mtaskp->inBeginp(); edgep; edgep = edgep->inNextp()) {
+        const ExecMTask* const prevp = dynamic_cast<ExecMTask*>(edgep->fromp());
+        if (schedule.threadId(prevp) != thisThreadId) setMaskBit(pred, prevp->id());
+    }
+    return pred;
+}
+
+static void addMTaskToFunction(const ThreadSchedule& schedule, AstCFunc* funcp,
+                               const ExecMTask* mtaskp, const string& doneName, uint32_t nWords) {
     AstNodeModule* const modp = v3Global.rootp()->topModulep();
     FileLine* const fl = modp->fileline();
 
@@ -3051,19 +3103,12 @@ static void addMTaskToFunction(const ThreadSchedule& schedule, const uint32_t th
         funcp->addStmtsp(new AstCStmt{fl, stmt});
     };
 
-    if (const uint32_t nDependencies = schedule.crossThreadDependencies(mtaskp)) {
-        // This mtask has dependencies executed on another thread, so it may block. Create the task
-        // state variable and wait to be notified.
-        const string name = "__Vm_mtaskstate_" + cvtToStr(mtaskp->id());
-        AstBasicDType* const mtaskStateDtypep
-            = v3Global.rootp()->typeTablep()->findBasicDType(fl, VBasicDTypeKwd::MTASKSTATE);
-        AstVar* const varp = new AstVar{fl, VVarType::MODULETEMP, name, mtaskStateDtypep};
-        varp->valuep(new AstConst{fl, nDependencies});
-        varp->protect(false);  // Do not protect as we still have references in AstText
-        modp->addStmtsp(varp);
-        // For now, reference is still via text bashing
-        addStrStmt("vlSelf->" + name + +".waitUntilUpstreamDone(even_cycle);\n");
-    }
+    // Same-thread predecessors already ran earlier in this function. The mask
+    // lists only the other threads, so the wait is one load of the done word.
+    const string wait = emitWaitStmt(doneName, "even_cycle",
+                                    crossThreadPredMask(schedule, mtaskp, nWords),
+                                    "mt" + cvtToStr(mtaskp->id()));
+    if (!wait.empty()) addStrStmt(wait);
 
     if (v3Global.opt.profExec()) {
         const string& id = cvtToStr(mtaskp->id());
@@ -3098,22 +3143,49 @@ static void addMTaskToFunction(const ThreadSchedule& schedule, const uint32_t th
                    + ");\n");
     }
 
-    // For any dependent mtask that's on another thread, signal one dependency completion.
-    for (V3GraphEdge* edgep = mtaskp->outBeginp(); edgep; edgep = edgep->outNextp()) {
-        const ExecMTask* const nextp = dynamic_cast<ExecMTask*>(edgep->top());
-        if (schedule.threadId(nextp) != threadId) {
-            addStrStmt("vlSelf->__Vm_mtaskstate_" + cvtToStr(nextp->id())
-                       + ".signalUpstreamDone(even_cycle);\n");
-        }
-    }
+    // Publish this task's bit. Cross-thread successors observe it through
+    // their predecessor mask; same-thread successors do not look at it.
+    addStrStmt("vlSelf->" + doneName + ".signal(" + cvtToStr(mtaskp->id()) + ", even_cycle);\n");
 }
 
-static const std::vector<AstCFunc*> createThreadFunctions(const ThreadSchedule& schedule,
-                                                          const string& tag) {
+struct ThreadFuncs final {
+    std::vector<AstCFunc*> m_funcps;
+    string m_finalWait;
+};
+
+static ThreadFuncs createThreadFunctions(const ThreadSchedule& schedule, const string& tag) {
     AstNodeModule* const modp = v3Global.rootp()->topModulep();
     FileLine* const fl = modp->fileline();
 
-    std::vector<AstCFunc*> funcps;
+    uint32_t maxMTaskId = 0;
+    uint32_t maxThreadId = 0;
+    for (const std::vector<const ExecMTask*>& thread : schedule.threads) {
+        if (thread.empty()) continue;
+        maxThreadId = std::max(maxThreadId, schedule.threadId(thread.front()));
+        for (const ExecMTask* const mtaskp : thread) {
+            maxMTaskId = std::max(maxMTaskId, mtaskp->id());
+        }
+    }
+    // Task bits are the MTask ids. Thread-finished bits sit just above them
+    // so the join uses the same mask and the same even/odd protocol.
+    const uint32_t threadBase = maxMTaskId + 1;
+    const uint32_t nBits = threadBase + maxThreadId + 1;
+    const uint32_t nWords = (nBits + 63) >> 6;
+    if (nWords > MTASK_DONE_WORDS) {
+        v3fatal("MTask predecessor bitmask holds " << (MTASK_DONE_WORDS * 64)
+                                                   << " tasks; this graph needs " << nBits);
+    }
+    V3Stats::addStat("Scheduling, MTask done mask words", nWords);
+
+    const string doneName = "__Vm_mtask_done__" + tag;
+    AstBasicDType* const maskDtypep
+        = v3Global.rootp()->typeTablep()->findBasicDType(fl, VBasicDTypeKwd::MTASKMASK);
+    AstVar* const maskp = new AstVar{fl, VVarType::MODULETEMP, doneName, maskDtypep};
+    maskp->protect(false);  // Referenced from generated text
+    modp->addStmtsp(maskp);
+
+    ThreadFuncs result;
+    std::vector<uint64_t> threadPred(nWords, 0);
 
     // For each thread, create a function representing its entry point
     for (const std::vector<const ExecMTask*>& thread : schedule.threads) {
@@ -3122,7 +3194,7 @@ static const std::vector<AstCFunc*> createThreadFunctions(const ThreadSchedule& 
         const string name{"__Vthread__" + tag + "__" + cvtToStr(threadId)};
         AstCFunc* const funcp = new AstCFunc{fl, name, nullptr, "void"};
         modp->addStmtsp(funcp);
-        funcps.push_back(funcp);
+        result.m_funcps.push_back(funcp);
         funcp->isStatic(true);  // Uses void self pointer, so static and hand rolled
         funcp->isLoose(true);
         funcp->entryPoint(true);
@@ -3134,28 +3206,24 @@ static const std::vector<AstCFunc*> createThreadFunctions(const ThreadSchedule& 
 
         // Invoke each mtask scheduled to this thread from the thread function
         for (const ExecMTask* const mtaskp : thread) {
-            addMTaskToFunction(schedule, threadId, funcp, mtaskp);
+            addMTaskToFunction(schedule, funcp, mtaskp, doneName, nWords);
         }
 
-        // Unblock the fake "final" mtask when this thread is finished
-        funcp->addStmtsp(new AstCStmt{fl, "vlSelf->__Vm_mtaskstate_final__" + tag
-                                              + ".signalUpstreamDone(even_cycle);\n"});
+        // This thread has finished its tasks. The eval joins on these bits.
+        const uint32_t threadBit = threadBase + threadId;
+        funcp->addStmtsp(new AstCStmt{fl, "vlSelf->" + doneName + ".signal(" + cvtToStr(threadBit)
+                                              + ", even_cycle);\n"});
+        setMaskBit(threadPred, threadBit);
     }
 
-    // Create the fake "final" mtask state variable
-    AstBasicDType* const mtaskStateDtypep
-        = v3Global.rootp()->typeTablep()->findBasicDType(fl, VBasicDTypeKwd::MTASKSTATE);
-    AstVar* const varp
-        = new AstVar{fl, VVarType::MODULETEMP, "__Vm_mtaskstate_final__" + tag, mtaskStateDtypep};
-    varp->valuep(new AstConst(fl, funcps.size()));
-    varp->protect(false);  // Do not protect as we still have references in AstText
-    modp->addStmtsp(varp);
-
-    return funcps;
+    result.m_finalWait = emitWaitStmt(doneName, "vlSymsp->__Vm_even_cycle__" + tag, threadPred,
+                                      "final_" + tag);
+    return result;
 }
 
 static void addThreadStartToExecGraph(AstExecGraph* const execGraphp,
-                                      const std::vector<AstCFunc*>& funcps) {
+                                      const std::vector<AstCFunc*>& funcps,
+                                      const string& finalWait) {
     // FileLine used for constructing nodes below
     FileLine* const fl = v3Global.rootp()->fileline();
     const string& tag = execGraphp->name();
@@ -3189,8 +3257,7 @@ static void addThreadStartToExecGraph(AstExecGraph* const execGraphp,
         }
     }
 
-    addStrStmt("vlSelf->__Vm_mtaskstate_final__" + tag
-               + ".waitUntilUpstreamDone(vlSymsp->__Vm_even_cycle__" + tag + ");\n");
+    addStrStmt(finalWait);
 }
 
 static void implementExecGraph(AstExecGraph* const execGraphp) {
@@ -3203,11 +3270,11 @@ static void implementExecGraph(AstExecGraph* const execGraphp) {
 
     // Create a function to be run by each thread. Note this moves all AstMTaskBody nodes form the
     // AstExecGrap into the AstCFunc created
-    const std::vector<AstCFunc*>& funcps = createThreadFunctions(schedule, execGraphp->name());
-    UASSERT(!funcps.empty(), "Non-empty ExecGraph yields no threads?");
+    const ThreadFuncs& threads = createThreadFunctions(schedule, execGraphp->name());
+    UASSERT(!threads.m_funcps.empty(), "Non-empty ExecGraph yields no threads?");
 
     // Start the thread functions at the point this AstExecGraph is located in the tree.
-    addThreadStartToExecGraph(execGraphp, funcps);
+    addThreadStartToExecGraph(execGraphp, threads.m_funcps, threads.m_finalWait);
 }
 
 void V3Partition::finalize(AstNetlist* netlistp) {

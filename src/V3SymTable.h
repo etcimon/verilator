@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,7 +45,9 @@ class VSymEnt final {
     // Symbol table that can have a "superior" table for resolving upper references
     // MEMBERS
     using IdNameMap = std::multimap<std::string, VSymEnt*>;
-    IdNameMap m_idNameMap;  // Hash of variables by name
+    IdNameMap m_idNameMap;  // Name-ordered map. Iteration stays sorted so output is stable.
+    // O(1) lookup. The multimap above is the deterministic iteration order.
+    std::unordered_map<std::string, VSymEnt*> m_idHash;
     AstNode* m_nodep;  // Node that entry belongs to
     VSymEnt* m_fallbackp;  // Table "above" this one in name scope, for fallback resolution
     VSymEnt* m_parentp;  // Table that created this table, dot notation needed to resolve into it
@@ -121,21 +124,27 @@ public:
     void insert(const string& name, VSymEnt* entp) {
         UINFO(9, "     SymInsert se" << cvtToHex(this) << " '" << name << "' se" << cvtToHex(entp)
                                      << "  " << entp->nodep() << endl);
-        if (name != "" && m_idNameMap.find(name) != m_idNameMap.end()) {
+        if (name != "" && m_idHash.find(name) != m_idHash.end()) {
             if (!V3Error::errorCount()) {  // Else may have just reported warning
                 if (debug() >= 9 || V3Error::debugDefault()) dumpSelf(cout, "- err-dump: ", 1);
                 entp->nodep()->v3fatalSrc("Inserting two symbols with same name: " << name);
             }
         } else {
             m_idNameMap.emplace(name, entp);
+            if (name != "") m_idHash.emplace(name, entp);
         }
     }
     void reinsert(const string& name, VSymEnt* entp) {
+        // Empty names may be duplicated in the ordered map; keep that path on
+        // the multimap. Every other name is also in m_idHash.
         const auto it = m_idNameMap.find(name);
         if (name != "" && it != m_idNameMap.end()) {
             UINFO(9, "     SymReinsert se" << cvtToHex(this) << " '" << name << "' se"
                                            << cvtToHex(entp) << "  " << entp->nodep() << endl);
             it->second = entp;  // Replace
+            m_idHash[name] = entp;
+        } else if (name == "" && it != m_idNameMap.end()) {
+            it->second = entp;
         } else {
             insert(name, entp);
         }
@@ -143,14 +152,18 @@ public:
     VSymEnt* findIdFlat(const string& name) const {
         // Find identifier without looking upward through symbol hierarchy
         // First, scan this begin/end block or module for the name
-        const auto it = m_idNameMap.find(name);
-        UINFO(9, "     SymFind   se"
-                     << cvtToHex(this) << " '" << name << "' -> "
-                     << (it == m_idNameMap.end()
-                             ? "NONE"
-                             : "se" + cvtToHex(it->second) + " n=" + cvtToHex(it->second->nodep()))
-                     << endl);
-        if (it != m_idNameMap.end()) return (it->second);
+        const auto it = m_idHash.find(name);
+        if (it != m_idHash.end()) {
+            UINFO(9, "     SymFind   se" << cvtToHex(this) << " '" << name << "' -> se"
+                                         << cvtToHex(it->second) << " n="
+                                         << cvtToHex(it->second->nodep()) << endl);
+            return it->second;
+        }
+        if (name.empty()) {
+            const auto mit = m_idNameMap.find(name);
+            if (mit != m_idNameMap.end()) return mit->second;
+        }
+        UINFO(9, "     SymFind   se" << cvtToHex(this) << " '" << name << "' -> NONE" << endl);
         return nullptr;
     }
     VSymEnt* findIdFallback(const string& name) const {

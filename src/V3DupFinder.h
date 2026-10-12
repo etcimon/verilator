@@ -29,6 +29,7 @@
 
 #include <map>
 #include <memory>
+#include <unordered_map>
 
 //============================================================================
 
@@ -39,13 +40,17 @@ struct V3DupFinderUserSame {
     virtual ~V3DupFinderUserSame() = default;
 };
 
-// This really is just a multimap from 'node hash' to 'node pointer', with some minor extensions.
-class V3DupFinder final : private std::multimap<V3Hash, AstNode*> {
-    using Super = std::multimap<V3Hash, AstNode*>;
+// Hash from node hash to node pointer. Lookup is O(1). When several nodes
+// share a hash, the earliest inserted match wins, which is the order the
+// old tree map produced.
+class V3DupFinder final : private std::unordered_multimap<V3Hash, AstNode*> {
+    using Super = std::unordered_multimap<V3Hash, AstNode*>;
 
     // MEMBERS
     const V3Hasher* const m_hasherp = nullptr;  // Pointer to owned hasher
     const V3Hasher& m_hasher;  // Reference to hasher
+    std::unordered_map<const AstNode*, uint64_t> m_order;  // Insertion sequence
+    uint64_t m_next = 1;
 
 public:
     // CONSTRUCTORS
@@ -68,12 +73,20 @@ public:
     using Super::const_iterator;
     using Super::empty;
     using Super::end;
-    using Super::erase;
     using Super::iterator;
     using Super::size_type;
 
-    // Insert node into data structure
-    iterator insert(AstNode* nodep) { return emplace(m_hasher(nodep), nodep); }
+    // Insert node into data structure. unordered_multimap::emplace returns
+    // the iterator itself (not a pair); callers erase that iterator.
+    iterator insert(AstNode* nodep) {
+        m_order.emplace(nodep, m_next++);
+        return emplace(m_hasher(nodep), nodep);
+    }
+
+    iterator erase(iterator it) {
+        m_order.erase(it->second);
+        return Super::erase(it);
+    }
 
     // Erase node from data structure
     size_type erase(AstNode* nodep);

@@ -28,6 +28,7 @@
 #include "V3Cast.h"
 #include "V3Class.h"
 #include "V3Clean.h"
+#include "V3ClkSkip.h"
 #include "V3Clock.h"
 #include "V3Combine.h"
 #include "V3Common.h"
@@ -36,6 +37,7 @@
 #include "V3CoverageJoin.h"
 #include "V3Dead.h"
 #include "V3Delayed.h"
+#include "V3Dirty.h"
 #include "V3Depth.h"
 #include "V3DepthBlock.h"
 #include "V3Descope.h"
@@ -72,6 +74,7 @@
 #include "V3ParseSym.h"
 #include "V3Partition.h"
 #include "V3PreShell.h"
+#include "V3Prio.h"
 #include "V3Premit.h"
 #include "V3ProtectLib.h"
 #include "V3Randomize.h"
@@ -80,7 +83,9 @@
 #include "V3Scope.h"
 #include "V3Scoreboard.h"
 #include "V3Slice.h"
+#include "V3Soa.h"
 #include "V3Split.h"
+#include "V3SplitPlan.h"
 #include "V3SplitAs.h"
 #include "V3SplitVar.h"
 #include "V3Stats.h"
@@ -98,6 +103,7 @@
 #include "V3Unknown.h"
 #include "V3Unroll.h"
 #include "V3VariableOrder.h"
+#include "V3Wake.h"
 #include "V3Waiver.h"
 #include "V3Width.h"
 
@@ -208,7 +214,11 @@ static void process() {
         V3LinkLevel::wrapTop(v3Global.rootp());
     }
 
-    // Propagate constants into expressions
+    // Propagate constants into expressions. Constification merges adjacent
+    // part-select assignments into one wide assign, which erases the
+    // boundaries split_var needs. Mark cycle variables first so that merge
+    // leaves them alone (it already skips split_var).
+    if (v3Global.opt.fSplitPlan()) V3SplitPlan::splitPlanAll(v3Global.rootp());
     if (v3Global.opt.fConstBeforeDfg()) V3Const::constifyAllLint(v3Global.rootp());
 
     if (!(v3Global.opt.xmlOnly() && !v3Global.opt.flatten())) {
@@ -229,7 +239,22 @@ static void process() {
         // triggers and extra scheduler passes. Unrolling here is the same transformation
         // V3Unroll applies after V3Task; the second call later finds nothing left.
         // V3Begin must have converted FORs to WHILEs first (hence after debeginAll).
+        //
+        // Before that unroll, turn packed arrays that are only touched one element at
+        // a time into unpacked element tables, and pin the clocked loops that scan
+        // them so they stay one loop over the table instead of N copies of the body.
+        // Priority encoders run first: lzc index arrays are still packed selects,
+        // and a find-first / grant loop is still a loop rather than N bit tests.
+        if (v3Global.opt.fPrio()) V3Prio::prioAll(v3Global.rootp());
+        if (v3Global.opt.fSoa()) V3Soa::soaAll(v3Global.rootp());
+        // Wakeup compares are still loops here. A small tag (a physical
+        // register number) becomes a waiter bitmask so each writeback is one
+        // word OR instead of a compare against every entry.
+        if (v3Global.opt.fWake()) V3Wake::wakeAll(v3Global.rootp());
         V3Unroll::unrollAll(v3Global.rootp());
+        // Unrolled copies are new adjacent selects. Mark them before
+        // constify merges those copies into one wide assign.
+        if (v3Global.opt.fSplitPlan()) V3SplitPlan::splitPlanAll(v3Global.rootp());
         V3Const::constifyAllLint(v3Global.rootp());
 
         // Split packed variables into multiple pieces to resolve UNOPTFLAT.
@@ -408,6 +433,11 @@ static void process() {
         // Schedule the logic
         V3Sched::schedule(v3Global.rootp());
 
+        // Per-instance combo still runs from the shared input region after a
+        // clock gate has stopped that instance's edge trigger. Skip it when
+        // the nets it reads are unchanged.
+        if (v3Global.opt.fClockSkip()) V3ClkSkip::clkSkipAll(v3Global.rootp());
+
         // Convert sense lists into IF statements.
         V3Clock::clockAll(v3Global.rootp());
 
@@ -424,6 +454,11 @@ static void process() {
         // Remove unused vars
         V3Const::constifyAll(v3Global.rootp());
         V3Dead::deadifyAllScoped(v3Global.rootp());
+
+        // Wide hybrid cuts that could not be split still change-detect by a
+        // full vector compare. Arm the dirty bits now that every store exists
+        // and the trigger expressions already read them.
+        if (v3Global.opt.fDirty()) V3Dirty::dirtyAll(v3Global.rootp());
 
         // Create tracing logic, since we ripped out some signals the user might want to trace
         // Note past this point, we presume traced variables won't move between CFuncs

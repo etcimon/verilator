@@ -63,6 +63,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -247,10 +248,10 @@ class ParamProcessor final {
         explicit ModInfo(AstNodeModule* modp)
             : m_modp{modp} {}
     };
-    std::map<const std::string, ModInfo> m_modNameMap;  // Hash of created module flavors by name
-
-    std::map<const std::string, std::string>
-        m_longMap;  // Hash of very long names to unique identity number
+    // Identical parameter sets reuse one specialized module. Lookup is O(1);
+    // these maps are only queried by key, never scanned.
+    std::unordered_map<std::string, ModInfo> m_modNameMap;
+    std::unordered_map<std::string, std::string> m_longMap;  // Long names to a short identity
     int m_longId = 0;
 
     // All module names that are loaded from source code
@@ -258,7 +259,7 @@ class ParamProcessor final {
     V3StringSet m_allModuleNames;
 
     using ValueMapValue = std::pair<int, std::string>;
-    std::map<const V3Hash, ValueMapValue> m_valueMap;  // Hash of node hash to (param value, name)
+    std::unordered_map<V3Hash, ValueMapValue> m_valueMap;  // Node hash to (param value, name)
     int m_nextValue = 1;  // Next value to use in m_valueMap
 
     const AstNodeModule* m_modp = nullptr;  // Current module being processed
@@ -304,37 +305,50 @@ class ParamProcessor final {
         return st;
     }
 
-    static string paramValueKey(const AstNode* nodep) {
+    // One-buffer byte key. The characters match the old recursive string, so
+    // collision equality (and --debug-collision) is unchanged. Building it in
+    // place keeps a large struct parameter linear instead of quadratic.
+    static void appendParamValueKey(std::string& key, const AstNode* nodep) {
         if (const AstRefDType* const refp = VN_CAST(nodep, RefDType)) { nodep = refp->skipRefp(); }
-        string key = nodep->name();
         if (const AstIfaceRefDType* const ifrtp = VN_CAST(nodep, IfaceRefDType)) {
             if (ifrtp->cellp() && ifrtp->cellp()->modp()) {
-                key = ifrtp->cellp()->modp()->name();
+                key += ifrtp->cellp()->modp()->name();
             } else if (ifrtp->ifacep()) {
-                key = ifrtp->ifacep()->name();
+                key += ifrtp->ifacep()->name();
             } else {
                 nodep->v3fatalSrc("Can't parameterize interface without module name");
             }
-        } else if (const AstNodeUOrStructDType* const dtypep
-                   = VN_CAST(nodep, NodeUOrStructDType)) {
-            key += " ";
+            return;
+        }
+        key += nodep->name();
+        if (const AstNodeUOrStructDType* const dtypep = VN_CAST(nodep, NodeUOrStructDType)) {
+            key += ' ';
             key += dtypep->verilogKwd();
             key += " {";
             for (const AstNode* memberp = dtypep->membersp(); memberp;
                  memberp = memberp->nextp()) {
-                key += paramValueKey(memberp);
-                key += ";";
+                appendParamValueKey(key, memberp);
+                key += ';';
             }
-            key += "}";
+            key += '}';
         } else if (const AstMemberDType* const dtypep = VN_CAST(nodep, MemberDType)) {
-            key += " ";
-            key += paramValueKey(dtypep->subDTypep());
+            key += ' ';
+            appendParamValueKey(key, dtypep->subDTypep());
         } else if (const AstBasicDType* const dtypep = VN_CAST(nodep, BasicDType)) {
-            if (dtypep->isSigned()) { key += " signed"; }
+            if (dtypep->isSigned()) key += " signed";
             if (dtypep->isRanged()) {
-                key += "[" + cvtToStr(dtypep->left()) + ":" + cvtToStr(dtypep->right()) + "]";
+                key += '[';
+                key += cvtToStr(dtypep->left());
+                key += ':';
+                key += cvtToStr(dtypep->right());
+                key += ']';
             }
         }
+    }
+    static string paramValueKey(const AstNode* nodep) {
+        string key;
+        key.reserve(64);
+        appendParamValueKey(key, nodep);
         return key;
     }
 
