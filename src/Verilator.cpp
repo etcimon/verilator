@@ -440,11 +440,6 @@ static void process() {
         // Schedule the logic
         V3Sched::schedule(v3Global.rootp());
 
-        // Per-instance combo still runs from the shared input region after a
-        // clock gate has stopped that instance's edge trigger. Skip it when
-        // the nets it reads are unchanged.
-        if (v3Global.opt.fClockSkip()) V3ClkSkip::clkSkipAll(v3Global.rootp());
-
         // Convert sense lists into IF statements.
         V3Clock::clockAll(v3Global.rootp());
 
@@ -461,6 +456,11 @@ static void process() {
         // Remove unused vars
         V3Const::constifyAll(v3Global.rootp());
         V3Dead::deadifyAllScoped(v3Global.rootp());
+
+        // Per-instance combo still runs from the shared input region after a
+        // clock gate has stopped that instance's edge trigger. Skip it when
+        // the nets it reads are unchanged.
+        if (v3Global.opt.fClockSkip()) V3ClkSkip::clkSkipAll(v3Global.rootp());
 
         // Wide hybrid cuts that could not be split still change-detect by a
         // full vector compare. Arm the dirty bits now that every store exists

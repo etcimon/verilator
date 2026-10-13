@@ -388,6 +388,17 @@ private:
     bool m_fSplitPlan = false;  // -fsplit-plan: auto split_var on combo cycles (opt-in)
     bool m_fTableSlice = false;  // -ftable-slice: slice wide tables by output support (opt-in)
     bool m_fDirty = false;  // -fdirty: dirty-bit hybrid triggers (opt-in, see above)
+    // On with -O2. Packed variables that are only read and written through
+    // constant part-selects (plus a constant whole-variable reset) become one
+    // variable per select, so the NBA function moves a field with one
+    // load/store instead of a shift-and-mask on a wide vector. Any other
+    // whole-variable reference keeps the variable packed.
+    bool m_fFieldSplit = true;  // -fno-field-split: field split of packed vars
+    // On with -O1. A region guard `at(a) | at(b) | ...` over one trigger vector
+    // becomes one `wordAny(word, mask)` per 64-bit word touched: the same
+    // predicate, one load and one test instead of one per bit. On g6lc64_ooo
+    // the schedulers test 2,458 bits per pass over 1,084 guarded calls.
+    bool m_fTriggerWords = true;  // -fno-trigger-words: keep one test per trigger bit
     bool m_fReorder;     // main switch: -fno-reorder: reorder assignments in blocks
     bool m_fSplit;       // main switch: -fno-split: always assignment splitting
     bool m_fSubst;       // main switch: -fno-subst: substitute expression temp values
@@ -652,6 +663,8 @@ public:
     bool fClockSkip() const { return m_fClockSkip; }
     bool fSplitPlan() const { return m_fSplitPlan; }
     bool fDirty() const { return m_fDirty; }
+    bool fFieldSplit() const { return m_fFieldSplit; }
+    bool fTriggerWords() const { return m_fTriggerWords; }
     bool fReorder() const { return m_fReorder; }
     bool fSplit() const { return m_fSplit; }
     bool fSubst() const { return m_fSubst; }

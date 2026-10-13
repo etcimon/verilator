@@ -970,6 +970,8 @@ void V3Options::parseOpts(FileLine* fl, int argc, char** argv) {
             else if (item == "dirty") m_fDirty = false;
             else if (item == "table") m_fTable = false;
             else if (item == "table-slice") m_fTableSlice = false;
+            else if (item == "field-split") m_fFieldSplit = false;
+            else if (item == "trigger-words") m_fTriggerWords = false;
             else if (!item.empty()) fl->v3warn(E_UNSUPPORTED, "VERILATOR_FNO: unknown item '" << item << "'");
             pos = next + 1;
         }
@@ -1239,6 +1241,8 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-fsplit-plan", FOnOff, &m_fSplitPlan);
     DECL_OPTION("-ftable-slice", FOnOff, &m_fTableSlice);
     DECL_OPTION("-fdirty", FOnOff, &m_fDirty);
+    DECL_OPTION("-ffield-split", FOnOff, &m_fFieldSplit);
+    DECL_OPTION("-ftrigger-words", FOnOff, &m_fTriggerWords);
     DECL_OPTION("-freorder", FOnOff, &m_fReorder);
     DECL_OPTION("-fsplit", FOnOff, &m_fSplit);
     DECL_OPTION("-fsubst", FOnOff, &m_fSubst);
@@ -2016,7 +2020,10 @@ void V3Options::optimize(int level) {
     m_fMergeCond = flag;
     m_fReloop = flag;
     // m_fPrio, m_fSoa, m_fWake, m_fDirty, m_fClockSkip, m_fSplitPlan, m_fTableSlice are
-    // opt-in only (see V3Options.h)
+    // opt-in only (see V3Options.h). m_fFieldSplit and m_fTriggerWords stay on at -O1
+    // and above.
+    m_fFieldSplit = flag;
+    m_fTriggerWords = flag;
     m_fReorder = flag;
     m_fSplit = flag;
     m_fSubst = flag;

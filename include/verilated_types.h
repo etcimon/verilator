@@ -31,10 +31,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -72,6 +75,164 @@ extern std::string VL_TO_STRING_W(int words, const WDataInP obj);
 #define VL_OUT64(name, msb, lsb) QData name  ///< Declare output signal, 33-64bits
 #define VL_OUT(name, msb, lsb) IData name  ///< Declare output signal, 17-32 bits
 #define VL_OUTW(name, msb, lsb, words) VlWide<words> name  ///< Declare output signal, 65+ bits
+
+//===================================================================
+// SIMD WORD-VECTOR KERNELS
+//
+// The wide helpers below are loops over 32-bit words whose trip count is a
+// compile-time constant once inlined. At -O2 the compiler's very-cheap
+// vectoriser refuses any loop that would need an epilogue, so a 10-word copy
+// stays ten scalar moves and a funnel shift over 20 words stays 40 shifts and
+// 20 ors. These kernels use the portable vector extension of GCC/Clang:
+// chunks of VL_SIMD_WORDS words through unaligned loads/stores, then a scalar
+// tail, and the plain scalar loop when the target has no vector unit or
+// VL_DISABLE_SIMD / VL_PORTABLE_ONLY is set. Lane k of a chunk depends only on
+// lane k (or, for the funnels, on source words k and k+1), so whole-array
+// aliasing (owp == lwp) is as safe as the scalar loop was; the funnel kernels
+// are only used when source and destination are disjoint. Width follows the
+// -march the model is compiled with: 16 words with AVX-512 when
+// VL_SIMD_PREFER_512 is set, 8 with AVX2, 4 with SSE2/NEON.
+#if !defined(VL_DISABLE_SIMD) && !defined(VL_PORTABLE_ONLY) \
+    && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX512F__) && defined(VL_SIMD_PREFER_512)
+#define VL_SIMD_WORDS 16
+#elif defined(__AVX2__)
+#define VL_SIMD_WORDS 8
+#elif defined(__SSE2__) || defined(__ARM_NEON) || defined(__aarch64__)
+#define VL_SIMD_WORDS 4
+#endif
+#endif
+
+#ifdef VL_SIMD_WORDS
+typedef EData VlSimdE __attribute__((vector_size(VL_SIMD_WORDS * sizeof(EData))));
+static inline VlSimdE _vl_simd_load(const EData* p) VL_PURE {
+    VlSimdE v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline void _vl_simd_store(EData* p, VlSimdE v) VL_MT_SAFE { std::memcpy(p, &v, sizeof(v)); }
+static inline EData _vl_simd_or_lanes(VlSimdE v) VL_PURE {
+    EData r = 0;
+    for (int k = 0; k < VL_SIMD_WORDS; ++k) r |= v[k];
+    return r;
+}
+#endif
+
+// True when [ap, ap+awords) and [bp, bp+bwords) share no word.
+static inline bool _vl_words_disjoint(const EData* ap, int awords, const EData* bp,
+                                      int bwords) VL_PURE {
+    const uintptr_t a0 = reinterpret_cast<uintptr_t>(ap);
+    const uintptr_t b0 = reinterpret_cast<uintptr_t>(bp);
+    return a0 + static_cast<uintptr_t>(awords) * sizeof(EData) <= b0
+           || b0 + static_cast<uintptr_t>(bwords) * sizeof(EData) <= a0;
+}
+
+// owp[i] = lwp[i]; the compiler expands a constant-size memmove into the widest
+// moves the target has, and memmove is defined for any overlap.
+static inline void _vl_words_copy(EData* owp, const EData* lwp, int words) VL_MT_SAFE {
+    if (words > 0) std::memmove(owp, lwp, static_cast<size_t>(words) * sizeof(EData));
+}
+static inline void _vl_words_zero(EData* owp, int words) VL_MT_SAFE {
+    if (words > 0) std::memset(owp, 0, static_cast<size_t>(words) * sizeof(EData));
+}
+// owp[i] = value (sign fills of the signed extends and arithmetic shifts).
+static inline void _vl_words_fill(EData* owp, EData value, int words) VL_MT_SAFE {
+    if (value == 0 || value == ~EData{0}) {
+        if (words > 0) std::memset(owp, value == 0 ? 0 : 0xff, static_cast<size_t>(words) * sizeof(EData));
+        return;
+    }
+    for (int i = 0; i < words; ++i) owp[i] = value;
+}
+
+// Elementwise kernels. Op is applied lane by lane.
+#define VL_SIMD_ELEMENTWISE_(name, expr_v, expr_s) \
+    static inline void name(EData* owp, const EData* lwp, const EData* rwp, int words) \
+        VL_MT_SAFE { \
+        int i = 0; \
+        VL_SIMD_CHUNKS_(expr_v) \
+        for (; i < words; ++i) owp[i] = (expr_s); \
+    }
+#ifdef VL_SIMD_WORDS
+#define VL_SIMD_CHUNKS_(expr_v) \
+    for (; i + VL_SIMD_WORDS <= words; i += VL_SIMD_WORDS) { \
+        const VlSimdE l = _vl_simd_load(lwp + i); \
+        const VlSimdE r = _vl_simd_load(rwp + i); \
+        (void)r; \
+        _vl_simd_store(owp + i, (expr_v)); \
+    }
+#else
+#define VL_SIMD_CHUNKS_(expr_v)
+#endif
+VL_SIMD_ELEMENTWISE_(_vl_words_and, l & r, lwp[i] & rwp[i])
+VL_SIMD_ELEMENTWISE_(_vl_words_or, l | r, lwp[i] | rwp[i])
+VL_SIMD_ELEMENTWISE_(_vl_words_xor, l ^ r, lwp[i] ^ rwp[i])
+VL_SIMD_ELEMENTWISE_(_vl_words_not, ~l, ~lwp[i])
+VL_SIMD_ELEMENTWISE_(_vl_words_andnot, l & ~r, lwp[i] & ~rwp[i])
+#undef VL_SIMD_CHUNKS_
+#undef VL_SIMD_ELEMENTWISE_
+
+// OR over all words of (lwp[i] ^ rwp[i]); zero iff equal.
+static inline EData _vl_words_orxor(const EData* lwp, const EData* rwp, int words) VL_PURE {
+    EData acc = 0;
+    int i = 0;
+#ifdef VL_SIMD_WORDS
+    if (i + VL_SIMD_WORDS <= words) {
+        VlSimdE vacc = _vl_simd_load(lwp) ^ _vl_simd_load(rwp);
+        for (i = VL_SIMD_WORDS; i + VL_SIMD_WORDS <= words; i += VL_SIMD_WORDS) {
+            vacc |= _vl_simd_load(lwp + i) ^ _vl_simd_load(rwp + i);
+        }
+        acc = _vl_simd_or_lanes(vacc);
+    }
+#endif
+    for (; i < words; ++i) acc |= lwp[i] ^ rwp[i];
+    return acc;
+}
+static inline EData _vl_words_orall(const EData* lwp, int words) VL_PURE {
+    EData acc = 0;
+    int i = 0;
+#ifdef VL_SIMD_WORDS
+    if (i + VL_SIMD_WORDS <= words) {
+        VlSimdE vacc = _vl_simd_load(lwp);
+        for (i = VL_SIMD_WORDS; i + VL_SIMD_WORDS <= words; i += VL_SIMD_WORDS) {
+            vacc |= _vl_simd_load(lwp + i);
+        }
+        acc = _vl_simd_or_lanes(vacc);
+    }
+#endif
+    for (; i < words; ++i) acc |= lwp[i];
+    return acc;
+}
+// XOR over all words (parity reductions).
+static inline EData _vl_words_xorall(const EData* lwp, int words) VL_PURE {
+    EData acc = 0;
+    int i = 0;
+#ifdef VL_SIMD_WORDS
+    if (i + VL_SIMD_WORDS <= words) {
+        VlSimdE vacc = _vl_simd_load(lwp);
+        for (i = VL_SIMD_WORDS; i + VL_SIMD_WORDS <= words; i += VL_SIMD_WORDS) {
+            vacc ^= _vl_simd_load(lwp + i);
+        }
+        for (int k = 0; k < VL_SIMD_WORDS; ++k) acc ^= vacc[k];
+    }
+#endif
+    for (; i < words; ++i) acc ^= lwp[i];
+    return acc;
+}
+
+// Funnel: dst[t] = (src[t] >> shr) | (src[t + 1] << shl) for t in [0, n).
+// Reads src[0 .. n]; caller guarantees disjointness and 0 < shr, shl < 32.
+static inline void _vl_words_funnel(EData* dst, const EData* src, int n, int shr,
+                                    int shl) VL_MT_SAFE {
+    int t = 0;
+#ifdef VL_SIMD_WORDS
+    for (; t + VL_SIMD_WORDS <= n; t += VL_SIMD_WORDS) {
+        const VlSimdE cur = _vl_simd_load(src + t);
+        const VlSimdE nxt = _vl_simd_load(src + t + 1);
+        _vl_simd_store(dst + t, (cur >> shr) | (nxt << shl));
+    }
+#endif
+    for (; t < n; ++t) dst[t] = (src[t] >> shr) | (src[t + 1] << shl);
+}
 
 //===================================================================
 // Activity trigger vector
@@ -130,23 +291,30 @@ public:
     bool at(size_t index) const {
         return (m_words.at(index / WORD_BITS) >> (index % WORD_BITS)) & 1;
     }
+    // True iff any of the elements selected by 'mask' in 64-bit word 'word' is
+    // set: the region guard `at(a) | at(b) | ...` for bits of one word, as one
+    // load and one test (V3Clock emits it under -ftrigger-words).
+    bool wordAny(size_t word, Word mask) const { return (m_words[word] & mask) != 0; }
 
     // Return true iff at least one element is set
-    bool any() const {
-        Word acc = 0;
-        for (size_t i = 0; i < T_words; ++i) acc |= m_words[i];
-        return acc != 0;
-    }
+    bool any() const { return _vl_words_orall(ewords(), T_ewords) != 0; }
 
     // Set all elements true in 'this' that are set in 'other'
     void set(const VlTriggerVec<T_size>& other) {
-        for (size_t i = 0; i < T_words; ++i) m_words[i] |= other.m_words[i];
+        _vl_words_or(ewords(), ewords(), other.ewords(), T_ewords);
     }
 
     // Set elements of 'this' to 'a & !b' element-wise
     void andNot(const VlTriggerVec<T_size>& a, const VlTriggerVec<T_size>& b) {
-        for (size_t i = 0; i < T_words; ++i) m_words[i] = a.m_words[i] & ~b.m_words[i];
+        _vl_words_andnot(ewords(), a.ewords(), b.ewords(), T_ewords);
     }
+
+private:
+    // The 64-bit words viewed as 32-bit words for the word-vector kernels; every
+    // operation above is bitwise, so the split is invisible.
+    static constexpr int T_ewords = static_cast<int>(T_words * (WORD_BITS / 32));
+    EData* ewords() { return reinterpret_cast<EData*>(m_words.data()); }
+    const EData* ewords() const { return reinterpret_cast<const EData*>(m_words.data()); }
 };
 
 //===================================================================
@@ -250,11 +418,10 @@ struct VlWide final {
     // Default copy assignment operators are used.
     operator WDataOutP() VL_PURE { return &m_storage[0]; }  // This also allows []
     operator WDataInP() const VL_PURE { return &m_storage[0]; }  // This also allows []
+    // Change detection of wide signals: one vector OR-of-XOR instead of a
+    // compare-and-branch per word.
     bool operator!=(const VlWide<T_Words>& that) const VL_PURE {
-        for (size_t i = 0; i < T_Words; ++i) {
-            if (m_storage[i] != that.m_storage[i]) return true;
-        }
-        return false;
+        return _vl_words_orxor(m_storage, that.m_storage, static_cast<int>(T_Words)) != 0;
     }
 
     // METHODS
@@ -1032,6 +1199,19 @@ void VL_WRITEMEM_N(bool hex, int bits, const std::string& filename,
 /// IO has an unpacked array.
 
 template <class T_Value, std::size_t T_Depth>
+struct VlUnpacked;
+
+// Element types whose arrays compare correctly as raw bytes: the integer data
+// types, packed vectors, and unpacked arrays of those. Not real (NaN, -0.0) and
+// not the class-like containers.
+template <typename T>
+struct VlIsBitwiseComparable : std::integral_constant<bool, std::is_integral<T>::value> {};
+template <std::size_t T_Words>
+struct VlIsBitwiseComparable<VlWide<T_Words>> : std::true_type {};
+template <class T_Value, std::size_t T_Depth>
+struct VlIsBitwiseComparable<VlUnpacked<T_Value, T_Depth>> : VlIsBitwiseComparable<T_Value> {};
+
+template <class T_Value, std::size_t T_Depth>
 struct VlUnpacked final {
     // MEMBERS
     // This should be the only data member, otherwise generated static initializers need updating
@@ -1073,6 +1253,12 @@ struct VlUnpacked final {
 private:
     template <typename T_Val, std::size_t T_Dep>
     static bool neq(const VlUnpacked<T_Val, T_Dep>& a, const VlUnpacked<T_Val, T_Dep>& b) {
+        // Integer and packed-vector elements have no padding and no NaN, so the
+        // whole array compares as bytes (vectorised memcmp); anything else
+        // (real, strings, queues) keeps the element-wise '!='.
+        if (VlIsBitwiseComparable<T_Val>::value) {
+            return std::memcmp(&a.m_storage, &b.m_storage, sizeof(a.m_storage)) != 0;
+        }
         for (size_t i = 0; i < T_Dep; ++i) {
             // Recursive 'neq', in case T_Val is also a VlUnpacked<_, _>
             if (neq(a.m_storage[i], b.m_storage[i])) return true;

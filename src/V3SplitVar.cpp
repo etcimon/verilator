@@ -1443,8 +1443,66 @@ const char* SplitVarImpl::cannotSplitPackedVarReason(const AstVar* varp) {
 //######################################################################
 // Split class functions
 
+// Mark a packed variable so the existing splitter makes one variable per
+// constant part-select. A reset or initializer (`q <= '0`) is kept: it becomes
+// one constant store per field. Any other whole-variable use becomes a concat
+// of every field, which is the expansion that made split-plan slower, so those
+// variables stay packed. A select whose bounds are not constant stays packed.
+void markFieldSplits(AstNetlist* nodep) {
+    if (!v3Global.opt.fFieldSplit()) return;
+    struct Use final {
+        bool bad = false;
+        std::set<std::pair<int, int>> slices;  // lsb, width
+    };
+    std::map<AstVar*, Use> uses;
+    nodep->foreach([&](AstVarRef* refp) {
+        AstVar* const varp = refp->varp();
+        if (!varp || varp->attrSplitVar() || varp->isTrace()) return;
+        Use& use = uses[varp];
+        if (use.bad) return;
+        if (const AstSel* const selp = VN_CAST(refp->backp(), Sel)) {
+            if (selp->fromp() != refp) {
+                use.bad = true;
+                return;
+            }
+            const AstConst* const lsbp = VN_CAST(selp->lsbp(), Const);
+            const AstConst* const widthp = VN_CAST(selp->widthp(), Const);
+            const int width = widthp ? widthp->toSInt() : 0;
+            if (!lsbp || !widthp || width <= 0) {
+                use.bad = true;
+                return;
+            }
+            use.slices.emplace(lsbp->toSInt(), width);
+            return;
+        }
+        // Whole-variable write of a constant: reset / initializer.
+        const AstNodeAssign* const assignp = VN_CAST(refp->backp(), NodeAssign);
+        if (assignp && assignp->lhsp() == refp && VN_IS(assignp->rhsp(), Const)) return;
+        use.bad = true;
+    });
+    int marked = 0;
+    for (auto& pair : uses) {
+        AstVar* const varp = pair.first;
+        const Use& use = pair.second;
+        if (use.bad || varp->attrSplitVar() || varp->isTrace()) continue;
+        if (varp->width() < 64 || varp->width() > 8192) continue;
+        // Each distinct select becomes its own variable. Past this, the reset
+        // block and the symbol table grow faster than the mask code shrinks.
+        if (use.slices.size() < 2 || use.slices.size() > 256) continue;
+        if (varp->dtypep()->dimensions(false).second != 0) continue;
+        if (!V3SplitVar::canSplitVar(varp)) continue;
+        varp->attrSplitVar(true);
+        varp->attrSplitAuto(true);
+        ++marked;
+        UINFO(4, "FieldSplit " << varp->prettyNameQ() << " width " << varp->width()
+                               << " slices " << use.slices.size() << endl);
+    }
+    V3Stats::addStat("SplitVar, auto field variables", marked);
+}
+
 void V3SplitVar::splitVariable(AstNetlist* nodep) {
     UINFO(2, __FUNCTION__ << ": " << endl);
+    markFieldSplits(nodep);
     SplitVarRefsMap refs;
     {
         const SplitUnpackedVarVisitor visitor{nodep};

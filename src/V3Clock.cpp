@@ -35,6 +35,7 @@
 #include "V3Ast.h"
 #include "V3Global.h"
 #include "V3Sched.h"
+#include "V3Stats.h"
 
 #include <algorithm>
 
@@ -79,15 +80,74 @@ private:
     AstSenTree* m_lastSenp = nullptr;  // Last sensitivity match, so we can detect duplicates.
     AstIf* m_lastIfp = nullptr;  // Last sensitivity if active to add more under
     bool m_inSampled = false;  // True inside a sampled expression
+    VDouble0 m_statTriggerBitsMerged;  // Trigger bits folded into a word test
+    VDouble0 m_statTriggerWordTests;  // wordAny tests emitted
 
     // METHODS
 
+    // A sense item that is a constant-index test of one trigger vector: the
+    // vector's variable, the 64-bit word the bit lives in, and the bit's mask.
+    struct TriggerBit {
+        AstVarScope* m_vscp;
+        uint32_t m_word;
+        uint64_t m_mask;
+    };
+    static bool triggerBitOf(AstNodeExpr* sensp, TriggerBit& out) {
+        AstCMethodHard* const callp = VN_CAST(sensp, CMethodHard);
+        if (!callp || callp->name() != "at") return false;
+        AstVarRef* const refp = VN_CAST(callp->fromp(), VarRef);
+        if (!refp || !refp->varScopep()) return false;
+        const AstBasicDType* const basicp = refp->varScopep()->dtypep()->basicp();
+        if (!basicp || !basicp->isTriggerVec()) return false;
+        AstConst* const idxp = VN_CAST(callp->pinsp(), Const);
+        if (!idxp || idxp->nextp() || idxp->num().isFourState()) return false;
+        const uint32_t index = idxp->toUInt();
+        out = TriggerBit{refp->varScopep(), index / 64, uint64_t{1} << (index % 64)};
+        return true;
+    }
     AstNodeExpr* createSenseEquation(AstSenItem* nodesp) {
         AstNodeExpr* senEqnp = nullptr;
+        // Trigger bits grouped by (vector, word), in first-seen order so the
+        // emitted test order stays deterministic; -fno-trigger-words keeps one
+        // at() per bit.
+        std::vector<TriggerBit> words;
         for (AstSenItem* senp = nodesp; senp; senp = VN_AS(senp->nextp(), SenItem)) {
             UASSERT_OBJ(senp->edgeType() == VEdgeType::ET_TRUE, senp, "Should have been lowered");
+            TriggerBit bit;
+            if (v3Global.opt.fTriggerWords() && triggerBitOf(senp->sensp(), bit)) {
+                bool merged = false;
+                for (TriggerBit& w : words) {
+                    if (w.m_vscp == bit.m_vscp && w.m_word == bit.m_word) {
+                        w.m_mask |= bit.m_mask;
+                        merged = true;
+                        ++m_statTriggerBitsMerged;
+                        break;
+                    }
+                }
+                if (!merged) words.push_back(bit);
+                continue;
+            }
             AstNodeExpr* const senOnep = senp->sensp()->cloneTree(false);
             senEqnp = senEqnp ? new AstOr{senp->fileline(), senEqnp, senOnep} : senOnep;
+        }
+        for (const TriggerBit& w : words) {
+            FileLine* const flp = nodesp->fileline();
+            AstNodeExpr* testp;
+            if (__builtin_popcountll(w.m_mask) == 1) {
+                // Single bit in this word: keep the precise at(index) load.
+                const uint32_t index = w.m_word * 64 + __builtin_ctzll(w.m_mask);
+                testp = new AstCMethodHard{flp, new AstVarRef{flp, w.m_vscp, VAccess::READ}, "at",
+                                           new AstConst{flp, index}};
+            } else {
+                AstConst* const wordp = new AstConst{flp, w.m_word};
+                wordp->addNext(new AstConst{flp, AstConst::Unsized64{}, w.m_mask});
+                testp = new AstCMethodHard{flp, new AstVarRef{flp, w.m_vscp, VAccess::READ},
+                                           "wordAny", wordp};
+                ++m_statTriggerWordTests;
+            }
+            VN_AS(testp, CMethodHard)->dtypeSetBit();
+            VN_AS(testp, CMethodHard)->pure(true);
+            senEqnp = senEqnp ? new AstOr{flp, senEqnp, testp} : testp;
         }
         return senEqnp;
     }
@@ -213,7 +273,11 @@ public:
         m_evalp = netlistp->evalp();
         iterate(netlistp);
     }
-    ~ClockVisitor() override = default;
+    ~ClockVisitor() override {
+        V3Stats::addStat("Optimizations, Trigger bits merged into word tests",
+                         m_statTriggerBitsMerged);
+        V3Stats::addStat("Optimizations, Trigger word tests", m_statTriggerWordTests);
+    }
 };
 
 //######################################################################

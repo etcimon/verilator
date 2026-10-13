@@ -10,14 +10,24 @@ if (!$::Driver) { use FindBin; exec("$FindBin::Bin/bootstrap.pl", @ARGV, $0); di
 
 scenarios(simulator => 1);
 
+# 1,000 cycles at the driver's 10-unit clock period; the default sim_time (1100)
+# would time out before the fixture's $finish. _make_main reads $Self directly.
+$Self->{sim_time} = 12000;
+
 compile(
-    verilator_flags2 => ["--stats", "--debug-check", "-fclock-skip"],
+    verilator_flags2 => ["--stats", "--debug-check", "-fclock-skip", "-fno-gate", "-fno-dfg"],
     );
 
-if ($Self->{vlt_all}) {
-    file_grep($Self->{stats}, qr/Optimizations, Clock skip scopes\s+(\d+)/, 2);
+if ($Self->{vlt}) {
+    file_grep($Self->{stats}, qr/Optimizations, Clock skip scopes\s+[1-9]\d*/);
+    file_grep($Self->{stats}, qr/Optimizations, Clock skip invalidation edges\s+[1-9]\d*/);
+    file_grep($Self->{stats}, qr/Optimizations, Clock skip disjoint subscriptions\s+[1-9]\d*/);
+    file_grep_not($Self->{stats}, qr/Optimizations, Clock skip unsupported model/);
+    file_grep($Self->{stats}, qr/Optimizations, Trigger word tests\s+[1-9]\d*/);
     my @files = glob_all("$Self->{obj_dir}/$Self->{vm_prefix}___024root__DepSet_*.cpp");
     file_grep_any(\@files, qr/__Vclkskip/);
+} elsif ($Self->{vltmt}) {
+    file_grep($Self->{stats}, qr/Optimizations, Clock skip unsupported model\s+(\d+)/, 1);
 }
 
 execute(
