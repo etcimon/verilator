@@ -359,6 +359,10 @@ private:
         txtp->addText(fl, "void* " + m_libName + "_protectlib_create(const char* scopep__V) {\n");
         txtp->addText(fl, /**/ m_topName + "_container* const handlep__V = new " + m_topName
                               + "_container{scopep__V};\n");
+        // Registered under its scope so a testbench can reach the child's public
+        // internals (hierarchical Verilation hides them from the top's rootp)
+        txtp->addText(fl, /**/ "Verilated::hierModelRegister(scopep__V, static_cast<" + m_topName
+                              + "*>(handlep__V));\n");
         txtp->addText(fl, /**/ "return handlep__V;\n");
         txtp->addText(fl, "}\n\n");
 

@@ -425,8 +425,14 @@ string V3Options::allArgsStringForHierBlock(bool forTop) const {
                 continue;
             }
         } else {  // Not an option
-            if (vFiles.find(*it) != vFiles.end()  // Remove HDL
-                || m_cppFiles.find(*it) != m_cppFiles.end()) {  // Remove C++
+            // m_allArgs keeps the argument as written (a -f file may say
+            // ${REPO}/x.sv); m_vFiles keeps it substituted. Compare both forms,
+            // or the child run parses that file twice and -Wno-MODDUP then
+            // deletes the second package copy under live import pointers.
+            const string subst = V3Os::filenameSubstitute(*it);
+            if (vFiles.find(*it) != vFiles.end() || vFiles.find(subst) != vFiles.end()  // HDL
+                || m_cppFiles.find(*it) != m_cppFiles.end()
+                || m_cppFiles.find(subst) != m_cppFiles.end()) {  // Remove C++
                 continue;
             }
         }

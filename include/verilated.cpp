@@ -2779,6 +2779,22 @@ VerilatedSyms::~VerilatedSyms() {
 //===========================================================================
 // Verilated:: Methods
 
+// Hierarchical Verilation child registry (see Verilated::hierModelRegister)
+static VerilatedMutex s_hierModelMutex;
+static std::map<std::string, void*>& hierModels() VL_MT_SAFE_EXCLUDES(s_hierModelMutex) {
+    static std::map<std::string, void*> s_models;
+    return s_models;
+}
+void Verilated::hierModelRegister(const char* scopep, void* modelp) VL_MT_SAFE {
+    const VerilatedLockGuard lock{s_hierModelMutex};
+    hierModels()[std::string{scopep}] = modelp;
+}
+void* Verilated::hierModelFind(const char* scopep) VL_MT_SAFE {
+    const VerilatedLockGuard lock{s_hierModelMutex};
+    const auto it = hierModels().find(std::string{scopep});
+    return it == hierModels().end() ? nullptr : it->second;
+}
+
 void Verilated::debug(int level) VL_MT_SAFE {
     s_debug = level;
     if (level) {

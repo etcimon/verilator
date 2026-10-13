@@ -775,6 +775,11 @@ public:
     static void commandArgsAdd(int argc, const char** argv) {
         Verilated::threadContextp()->commandArgsAdd(argc, argv);
     }
+    /// Hierarchical Verilation: the child model instantiated for a scope
+    /// (registered by the --lib-create wrapper's _protectlib_create, looked up
+    /// by a testbench that reads the child's public internals through its rootp)
+    static void hierModelRegister(const char* scopep, void* modelp) VL_MT_SAFE;
+    static void* hierModelFind(const char* scopep) VL_MT_SAFE;
     /// Return VerilatedContext::commandArgsPlusMatch using current thread's VerilatedContext
     static const char* commandArgsPlusMatch(const char* prefixp) VL_MT_SAFE {
         return Verilated::threadContextp()->commandArgsPlusMatch(prefixp);

@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -778,6 +779,23 @@ class LinkDotFindVisitor final : public VNVisitor {
 
         m_statep->insertDUnit(nodep);
 
+        // Every package import must name a package that is still in the netlist:
+        // one that V3LinkCells removed (a duplicate declaration under -Wno-MODDUP,
+        // an unused std package) leaves a dangling pointer that only dies here.
+        {
+            std::unordered_set<const AstNode*> live;
+            for (AstNodeModule* modp = nodep->modulesp(); modp;
+                 modp = VN_AS(modp->nextp(), NodeModule))
+                live.insert(modp);
+            nodep->foreach([&](AstPackageImport* impp) {
+                if (!impp->packagep() || !live.count(impp->packagep())) {
+                    impp->v3fatalSrc("Import names a package that is no longer in the design"
+                                     " (removed as a duplicate declaration or unused): '"
+                                     << impp->prettyName() << "'");
+                }
+            });
+        }
+
         // First back iterate, to find all packages. Backward as must do base
         // packages before using packages
         iterateChildrenBackwards(nodep);
@@ -1393,6 +1411,19 @@ class LinkDotFindVisitor final : public VNVisitor {
     }
     void visit(AstPackageImport* nodep) override {
         UINFO(4, "  Link: " << nodep << endl);
+        if (!nodep->packagep()->user1u().toSymEnt()) {
+            // The imported package has not been given its symbol yet: it sits
+            // earlier in the level-sorted module list than this importer (a
+            // ranking the top-module choice of a hierarchical child can produce).
+            // Name both sides instead of dying inside the assertion's formatter.
+            nodep->v3fatalSrc("Package imported before its symbol exists: '"
+                              << nodep->packagep()->prettyName() << "' (level "
+                              << nodep->packagep()->level() << ", dead="
+                              << nodep->packagep()->dead() << ") imported from '"
+                              << (m_modSymp && m_modSymp->nodep() ? m_modSymp->nodep()->prettyName()
+                                                                  : std::string{"?"})
+                              << "'");
+        }
         VSymEnt* const srcp = m_statep->getNodeSym(nodep->packagep());
         if (nodep->name() == "*") {
             if (nodep->packagep() != v3Global.rootp()->stdPackagep()) {
