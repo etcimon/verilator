@@ -431,6 +431,7 @@ using SplitVarRefsMap = std::map<AstNodeModule*, RefsInModule, AstNodeComparator
 class SplitUnpackedVarVisitor final : public VNVisitor, public SplitVarImpl {
     using VarSet = std::set<AstVar*, AstNodeComparator>;
     VarSet m_foundTargetVar;
+    VarSet m_registered;  // Candidates registered for the current module (pre-pass + visit)
     UnpackRefMap m_refs;
     AstNodeModule* m_modp = nullptr;
     // AstNodeStmt, AstCell, or AstAlways(Public) for sensitivity
@@ -497,9 +498,30 @@ class SplitUnpackedVarVisitor final : public VNVisitor, public SplitVarImpl {
         UASSERT_OBJ(m_refs.empty(), nodep, "The last module didn't finish split()");
         m_modp = nodep;
         m_tempNames.reset();
+        // Register every module-level candidate before any reference is visited.
+        // tryAdd() silently drops a reference to a variable that is not yet
+        // registered, so a declaration that follows its uses in the statement
+        // list (legal SystemVerilog, and the shape V3Begin leaves behind when it
+        // hoists a generate block's variables to the end of the module) would be
+        // split with only the references found after it, and the earlier ones
+        // would keep pointing at the deleted variable (T25: the LibreCore
+        // g6lc_smt_csr_bank commit_ack_g miscompile).
+        for (AstNode* stmtp = nodep->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+            if (AstVar* const varp = VN_CAST(stmtp, Var)) registerCandidate(varp);
+        }
         iterateChildren(nodep);
         split();
         m_modp = nullptr;
+        m_registered.clear();
+    }
+    void registerCandidate(AstVar* nodep) {
+        if (!nodep->attrSplitVar()) return;  // Nothing to do
+        if (!m_registered.insert(nodep).second) return;  // Seen in the pre-pass
+        if (!cannotSplitReason(nodep)) {
+            m_refs.registerVar(nodep);
+            UINFO(4, nodep->name() << " is added to candidate list." << endl);
+        }
+        m_refsForPackedSplit[m_modp].add(nodep);
     }
     void visit(AstNodeStmt* nodep) override { setContextAndIterateChildren(nodep); }
     void visit(AstCell* nodep) override { setContextAndIterateChildren(nodep); }
@@ -572,14 +594,7 @@ class SplitUnpackedVarVisitor final : public VNVisitor, public SplitVarImpl {
             m_inFTask = nullptr;
         }
     }
-    void visit(AstVar* nodep) override {
-        if (!nodep->attrSplitVar()) return;  // Nothing to do
-        if (!cannotSplitReason(nodep)) {
-            m_refs.registerVar(nodep);
-            UINFO(4, nodep->name() << " is added to candidate list.\n");
-        }
-        m_refsForPackedSplit[m_modp].add(nodep);
-    }
+    void visit(AstVar* nodep) override { registerCandidate(nodep); }
     void visit(AstVarRef* nodep) override {
         if (!nodep->varp()->attrSplitVar()) return;  // Nothing to do
         if (m_refs.tryAdd(m_contextp, nodep, m_inFTask)) {

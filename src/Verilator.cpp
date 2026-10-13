@@ -260,6 +260,13 @@ static void process() {
         // Split packed variables into multiple pieces to resolve UNOPTFLAT.
         // should be after constifyAllLint() which flattens to 1D bit vector
         V3SplitVar::splitVariable(v3Global.rootp());
+        // The split wraps a one-statement always/initial body in a
+        // __VsplitVarBlk begin so it can add its temporaries there. Upstream
+        // splits before debeginAll and those begins are flattened with all the
+        // others; here they appear after it, so flatten them now -- a begin
+        // that survives to linkDotScoped has no symbol entry
+        // (t_split_var_0: "Module/etc never assigned a symbol entry?").
+        V3Begin::debeginAll(v3Global.rootp());
 
         // Expand inouts, stage 2
         // Also simplify pin connections to always be AssignWs in prep for V3Unknown
