@@ -381,9 +381,27 @@ public:
         } v(*this);
         v.iterate(nodep);
     }
+    // A collected node must still hang off the netlist: anything the unpacked
+    // split (or any pass between collection and use) unlinked or deleted is
+    // skipped and reported, instead of being rewritten through a dangling pointer
+    // (the T25 miscompile: a split element written from an unrelated module).
+    static bool stillLinked(const AstNode* nodep) {
+        const AstNode* p = nodep;
+        for (int depth = 0; p && depth < 100000; ++depth) {
+            if (VN_IS(p, Netlist)) return true;
+            if (reinterpret_cast<uintptr_t>(p->op1p()) == 1) return false;
+            p = p->backp();
+        }
+        return false;
+    }
     void visit(VNVisitor* visitor) {
         for (AstVar* const varp : m_vars) visitor->iterate(varp);
         for (AstSel* const selp : m_sels) {
+            if (!stillLinked(selp)) {
+                UINFO(0, "SplitVar: collected SEL no longer in the tree, skipped: "
+                             << cvtToHex(selp) << " " << selp->fileline() << endl);
+                continue;
+            }
             // If m_refs includes VarRef from ArraySel, remove it
             // because the VarRef would not be visited in SplitPackedVarVisitor::visit(AstSel*).
             if (AstVarRef* const refp = VN_CAST(selp->fromp(), VarRef)) {
@@ -398,6 +416,11 @@ public:
         }
         for (AstVarRef* const vrefp : m_refs) {
             UASSERT_OBJ(reinterpret_cast<uintptr_t>(vrefp->op1p()) != 1, vrefp, "stale");
+            if (!stillLinked(vrefp)) {
+                UINFO(0, "SplitVar: collected VARREF no longer in the tree, skipped: "
+                             << cvtToHex(vrefp) << " " << vrefp->fileline() << endl);
+                continue;
+            }
             visitor->iterate(vrefp);
         }
     }

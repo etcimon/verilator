@@ -75,7 +75,13 @@ private:
             const string newvarname{"__Vilp"};
             varp = new AstVar{fl, VVarType::STMTTEMP, newvarname, VFlagLogicPacked{}, 32};
             UASSERT_OBJ(cfuncp, fl, "Assignment not under a function");
+            // The loop may itself sit in initsp (V3Clock puts the __Vsampled copies
+            // there, at the top of _eval), so the declaration must lead that list,
+            // not trail it: emitted in order, a trailing declaration follows its use.
+            AstNode* const oldInitsp
+                = cfuncp->initsp() ? cfuncp->initsp()->unlinkFrBackWithNext() : nullptr;
             cfuncp->addInitsp(varp);
+            if (oldInitsp) cfuncp->addInitsp(oldInitsp);
             cfuncp->user1p(varp);
         }
         return varp;
