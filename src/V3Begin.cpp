@@ -123,22 +123,29 @@ private:
         }
     }
 
-    void renameAndStaticsRecurse(AstNode* const nodep) {
-        // Rename references and move InitialStatic items
-        if (AstVarRef* const varrefp = VN_CAST(nodep, VarRef)) {
-            const auto it = m_staticFuncVars.find(varrefp->varp());
-            if (it != m_staticFuncVars.end()) varrefp->name((*it)->name());
-        }
+    void renameAndStaticsRecurse(AstNode* const firstp) {
+        // Rename references and move InitialStatic items. Siblings are walked
+        // with a loop, not tail recursion: after unrolling and variable
+        // splitting a begin can hold tens of thousands of statements, and one
+        // stack frame per statement overflows an 8 MiB stack (SIGSEGV here on
+        // g6lc_rename_recover at the hyp8_mc geometry).
+        for (AstNode* nodep = firstp; nodep;) {
+            AstNode* const nextp = nodep->nextp();  // Read before a possible unlink below
+            if (AstVarRef* const varrefp = VN_CAST(nodep, VarRef)) {
+                const auto it = m_staticFuncVars.find(varrefp->varp());
+                if (it != m_staticFuncVars.end()) varrefp->name((*it)->name());
+            }
 
-        if (nodep->op1p()) renameAndStaticsRecurse(nodep->op1p());
-        if (nodep->op2p()) renameAndStaticsRecurse(nodep->op2p());
-        if (nodep->op3p()) renameAndStaticsRecurse(nodep->op3p());
-        if (nodep->op4p()) renameAndStaticsRecurse(nodep->op4p());
-        if (nodep->nextp()) renameAndStaticsRecurse(nodep->nextp());
+            if (nodep->op1p()) renameAndStaticsRecurse(nodep->op1p());
+            if (nodep->op2p()) renameAndStaticsRecurse(nodep->op2p());
+            if (nodep->op3p()) renameAndStaticsRecurse(nodep->op3p());
+            if (nodep->op4p()) renameAndStaticsRecurse(nodep->op4p());
 
-        if (VN_IS(nodep, InitialStatic)) {
-            nodep->unlinkFrBack();
-            m_ftaskp->addHereThisAsNext(nodep);
+            if (VN_IS(nodep, InitialStatic)) {
+                nodep->unlinkFrBack();
+                m_ftaskp->addHereThisAsNext(nodep);
+            }
+            nodep = nextp;
         }
     }
 

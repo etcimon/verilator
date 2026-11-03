@@ -1395,14 +1395,36 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
     }
 
 public:
-    // When reusing the information from SplitUnpackedVarVisitor
+    // Walk the tree as it is NOW, instead of visiting the AstSel/AstVarRef
+    // pointers SplitUnpackedVarVisitor collected: between collection and here the
+    // unpacked split, its run-time-index rewrites and the unroll/const passes
+    // delete and recreate nodes, and RefsInModule::stillLinked() then follows
+    // backp() through freed memory (use-after-free: a SIGSEGV in the PGO binary,
+    // and a DfgSel with a corrupted width -- V3DfgPeephole "OOPS" on
+    // g6lc_rename_recover at the hyp8_mc geometry). One extra module walk is
+    // cheap next to the rewriting itself. `refs` is kept for the call shape.
     SplitPackedVarVisitor(AstNetlist* nodep, SplitVarRefsMap& refs)
         : m_netp{nodep} {
-        // If you want ignore refs and walk the tne entire AST,
-        // just call iterateChildren(m_modp) and split() for each module
-        for (auto& i : refs) {
-            m_modp = i.first;
-            i.second.visit(this);
+        (void)refs;
+        for (AstNodeModule* modp = nodep->modulesp(); modp;
+             modp = VN_AS(modp->nextp(), NodeModule)) {
+            if (!VN_IS(modp, Module)) continue;
+            m_modp = modp;
+            // Register every candidate first: visit(AstSel*) looks the variable up
+            // and must not miss a reference that precedes its declaration (T25).
+            {
+                struct VarCollector final : public VNVisitor {
+                    std::vector<AstVar*> m_vars;
+                    void visit(AstVar* vp) override {
+                        if (vp->attrSplitVar()) m_vars.push_back(vp);
+                    }
+                    void visit(AstCell*) override {}  // Other modules walk themselves
+                    void visit(AstNode* np) override { iterateChildren(np); }
+                } collector;
+                collector.iterateChildren(modp);
+                for (AstVar* const varp : collector.m_vars) visit(varp);
+            }
+            iterateChildren(modp);
             split();
             m_modp = nullptr;
         }
