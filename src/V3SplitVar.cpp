@@ -123,6 +123,7 @@
 #include <algorithm>  // sort
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -381,49 +382,8 @@ public:
         } v(*this);
         v.iterate(nodep);
     }
-    // A collected node must still hang off the netlist: anything the unpacked
-    // split (or any pass between collection and use) unlinked or deleted is
-    // skipped and reported, instead of being rewritten through a dangling pointer
-    // (the T25 miscompile: a split element written from an unrelated module).
-    static bool stillLinked(const AstNode* nodep) {
-        const AstNode* p = nodep;
-        for (int depth = 0; p && depth < 100000; ++depth) {
-            if (VN_IS(p, Netlist)) return true;
-            if (reinterpret_cast<uintptr_t>(p->op1p()) == 1) return false;
-            p = p->backp();
-        }
-        return false;
-    }
-    void visit(VNVisitor* visitor) {
-        for (AstVar* const varp : m_vars) visitor->iterate(varp);
-        for (AstSel* const selp : m_sels) {
-            if (!stillLinked(selp)) {
-                UINFO(0, "SplitVar: collected SEL no longer in the tree, skipped: "
-                             << cvtToHex(selp) << " " << selp->fileline() << endl);
-                continue;
-            }
-            // If m_refs includes VarRef from ArraySel, remove it
-            // because the VarRef would not be visited in SplitPackedVarVisitor::visit(AstSel*).
-            if (AstVarRef* const refp = VN_CAST(selp->fromp(), VarRef)) {
-                m_refs.erase(refp);
-            } else if (AstVarRef* const refp = VN_CAST(selp->lsbp(), VarRef)) {
-                m_refs.erase(refp);
-            } else if (AstVarRef* const refp = VN_CAST(selp->widthp(), VarRef)) {
-                m_refs.erase(refp);
-            }
-            UASSERT_OBJ(reinterpret_cast<uintptr_t>(selp->op1p()) != 1, selp, "stale");
-            visitor->iterate(selp);
-        }
-        for (AstVarRef* const vrefp : m_refs) {
-            UASSERT_OBJ(reinterpret_cast<uintptr_t>(vrefp->op1p()) != 1, vrefp, "stale");
-            if (!stillLinked(vrefp)) {
-                UINFO(0, "SplitVar: collected VARREF no longer in the tree, skipped: "
-                             << cvtToHex(vrefp) << " " << vrefp->fileline() << endl);
-                continue;
-            }
-            visitor->iterate(vrefp);
-        }
-    }
+    // The packed split no longer visits these collected pointers directly:
+    // intermediate rewrites may delete them. It re-walks each live module tree.
 };
 
 using SplitVarRefsMap = std::map<AstNodeModule*, RefsInModule, AstNodeComparator>;
@@ -1394,18 +1354,48 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
         m_refs.clear();  // Done
     }
 
+    static const AstNodeModule* moduleOf(const AstNode* nodep) {
+        for (const AstNode* p = nodep; p; p = p->backp()) {
+            if (const AstNodeModule* const modp = VN_CAST(p, NodeModule)) return modp;
+        }
+        return nullptr;
+    }
+
 public:
-    // Walk the tree as it is NOW, instead of visiting the AstSel/AstVarRef
-    // pointers SplitUnpackedVarVisitor collected: between collection and here the
+    // Walk the tree as it is NOW, instead of visiting AstSel/AstVarRef pointers
+    // SplitUnpackedVarVisitor collected: between collection and here the
     // unpacked split, its run-time-index rewrites and the unroll/const passes
-    // delete and recreate nodes, and RefsInModule::stillLinked() then follows
-    // backp() through freed memory (use-after-free: a SIGSEGV in the PGO binary,
-    // and a DfgSel with a corrupted width -- V3DfgPeephole "OOPS" on
-    // g6lc_rename_recover at the hyp8_mc geometry). One extra module walk is
-    // cheap next to the rewriting itself. `refs` is kept for the call shape.
-    SplitPackedVarVisitor(AstNetlist* nodep, SplitVarRefsMap& refs)
+    // delete and recreate nodes. The pointer list can therefore contain stale
+    // addresses (the use-after-free behind the V3DfgPeephole "OOPS"/SIGSEGV on
+    // g6lc_rename_recover at the hyp8_mc geometry). `refs` is kept only for the
+    // call shape. Cross-module users are refused before the first split, so a
+    // later module cannot retain a reference to a declaration this pass deletes.
+    explicit SplitPackedVarVisitor(AstNetlist* nodep, SplitVarRefsMap& refs)
         : m_netp{nodep} {
         (void)refs;
+        std::unordered_set<const AstVar*> external;
+        std::set<std::string> xrefNames;
+        nodep->foreach([&](AstVarRef* refp) {
+            AstVar* const varp = refp->varp();
+            if (varp && moduleOf(refp) != moduleOf(varp)) external.insert(varp);
+        });
+        nodep->foreach([&](AstVarXRef* xrefp) {
+            xrefNames.insert(xrefp->name());
+            if (AstVar* const varp = xrefp->varp()) external.insert(varp);
+        });
+        nodep->foreach([&](AstVar* varp) {
+            if (!varp->attrSplitVar()) return;
+            // V3Begin hoists a generate block's variables as "<blk>__DOT__<name>";
+            // an unresolved dotted reference into the block still carries only
+            // <name>, so compare both the full and leaf names.
+            const std::string& vname = varp->name();
+            const size_t dot = vname.rfind("__DOT__");
+            const std::string leaf = dot == std::string::npos ? vname : vname.substr(dot + 7);
+            if (external.count(varp) || xrefNames.count(vname) || xrefNames.count(leaf)) {
+                warnNoSplit(varp, varp, "it is accessed from another module via a dot");
+                varp->attrSplitVar(false);
+            }
+        });
         for (AstNodeModule* modp = nodep->modulesp(); modp;
              modp = VN_AS(modp->nextp(), NodeModule)) {
             if (!VN_IS(modp, Module)) continue;
