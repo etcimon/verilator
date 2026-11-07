@@ -11,6 +11,7 @@
 // Lesser General Public License Version 3 or the Perl Artistic License
 // Version 2.0.
 // SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+// Modified by: Etienne Cimon, 2026 - preserve compound types on C++ ports.
 //
 //*************************************************************************
 
@@ -166,7 +167,8 @@ void EmitCBaseVisitor::emitVarDecl(const AstVar* nodep, bool asRef) {
         if (asRef && refNeedParens) { puts(")"); }
         emitDeclArrayBrackets(nodep);
         puts(";\n");
-    } else if (nodep->isIO() && basicp && !basicp->isOpaque()) {
+    } else if (nodep->isIO() && basicp && !basicp->isOpaque()
+               && !nodep->dtypeSkipRefp()->isCompound()) {
         if (nodep->isInoutish()) {
             puts("VL_INOUT");
         } else if (nodep->isWritable()) {

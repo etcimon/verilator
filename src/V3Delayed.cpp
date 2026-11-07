@@ -11,6 +11,9 @@
 // Lesser General Public License Version 3 or the Perl Artistic License
 // Version 2.0.
 // SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+// Modified by: Etienne Cimon, 2026 - footprint-aware BLKANDNBLK; route
+//              compatible packed delayed writes through the flagged
+//              per-select commit so mixed writes are actually safe.
 //
 //*************************************************************************
 // V3Delayed's Transformations:
@@ -61,6 +64,8 @@
 #include <deque>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -77,10 +82,8 @@ private:
     //  AstVarScope::user3p()   -> AstAlwaysPost*.  Post block for this variable used for
     //                                              AssignDlys in suspendable processes
     //  AstVarScope::user4p()   -> AstAlwaysPost*.  Post block for this variable
-    //  AstVarScope::user5p()   -> AstVarRef*. Last blocking or non-blocking reference
     //  AstVar::user2()         -> bool.  Set true if already made warning
     //  AstVarRef::user2()      -> bool.  Set true if already processed
-    //  AstVarRef::user5()      -> bool.  Set true if was blocking reference
     //  AstAlwaysPost::user2()  -> ActActive*.  Points to activity block of signal
     //                                      (valid when AstAlwaysPost::user4p is valid)
     //  AstAlwaysPost::user4()  -> AstIf*.  Last IF (__Vdlyvset__) created under this AlwaysPost
@@ -91,7 +94,6 @@ private:
     const VNUser2InUse m_inuser2;
     const VNUser3InUse m_inuser3;
     const VNUser4InUse m_inuser4;
-    const VNUser5InUse m_inuser5;
 
     // STATE
     AstActive* m_activep = nullptr;  // Current activate
@@ -116,34 +118,176 @@ private:
         return nodep;
     }
 
-    void markVarUsage(AstNodeVarRef* nodep, bool blocking) {
+    // Write footprint of one blocking or delayed assignment, used by the
+    // BLKANDNBLK overlap analysis. KIND::BITS is a constant packed bit
+    // range [lo,hi); KIND::ELEMS a constant unpacked index tuple; KIND::WHOLE
+    // anything that cannot be proven disjoint (plain variable, non-constant
+    // select, mixed select kinds, ...).
+    struct MixedWrite final {
+        enum Kind : uint8_t { WHOLE, BITS, ELEMS } kind = WHOLE;
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+        std::vector<uint64_t> elems;
+        bool isNba = false;
+        // True when the delayed write's commit only touches the written
+        // footprint: writes lowered through createDlyOnSet commit the exact
+        // select under a flag, and whole-variable shadow commits are safe
+        // because the NBA value wins on every bit. False for partial writes
+        // on the full-shadow scheme, whose post-commit copies the entire
+        // variable and could clobber unrelated blocking writes.
+        bool preciseCommit = true;
+        // True when the write sits in a clocked (or suspendable) process.
+        // Clocked blocking writes are ordered before the delayed-assignment
+        // commit, so mixed pairs involving them are safe even on overlapping
+        // footprints. Only combinational blocking writes can race the commit.
+        bool inClocked = false;
+        // FileLines outlive the AST nodes that referenced them (they are only
+        // released by FileLine::deleteAllRemaining at the end of the compile),
+        // so they stay valid after the write node itself is rewritten away.
+        const FileLine* refFl = nullptr;    // write reference location
+        const FileLine* assignFl = nullptr; // containing assignment location
+    };
+    std::map<AstVarScope*, std::vector<MixedWrite>> m_mixedWrites;
+    std::unordered_set<AstVarScope*> m_warnedMixedWrites;
+    // Variables whose delayed writes are lowered through createDlyOnSet
+    // (flagged per-select commits) vs the full-shadow AstVarRef path. Once a
+    // variable uses one scheme, later delayed writes to it must stay
+    // consistent or the two commit mechanisms would interleave incorrectly.
+    std::unordered_set<AstVarScope*> m_dlyOnSetVars;
+    std::unordered_set<AstVarScope*> m_simpleDlyVars;
+
+    // Compute the write footprint of a write VarRef by walking the select
+    // chain above it (Sel bit-ranges and ArraySel element indices with
+    // constant operands only).
+    MixedWrite footprintOf(AstNodeVarRef* nodep) {
+        MixedWrite fp;
+        fp.refFl = nodep->fileline();
+        if (const AstNode* const assignp = containingAssignment(nodep)) {
+            fp.assignFl = assignp->fileline();
+        }
+        if (!fp.assignFl) fp.assignFl = fp.refFl;
+        AstNode* curp = nodep;
+        bool sawSel = false;
+        bool sawArr = false;
+        int64_t bitLo = 0;
+        uint64_t bitW = 0;
+        while (true) {
+            AstNode* const parentp = curp->backp();
+            if (AstSel* const selp = VN_CAST(parentp, Sel)) {
+                if (selp->fromp() != curp || sawArr) {
+                    fp.kind = MixedWrite::WHOLE;
+                    return fp;
+                }
+                AstConst* const lsb = VN_CAST(selp->lsbp(), Const);
+                AstConst* const wid = VN_CAST(selp->widthp(), Const);
+                if (!lsb || !wid) {
+                    fp.kind = MixedWrite::WHOLE;
+                    return fp;
+                }
+                bitLo += lsb->toSInt();
+                bitW = wid->toUInt();
+                sawSel = true;
+                curp = selp;
+            } else if (AstArraySel* const arrp = VN_CAST(parentp, ArraySel)) {
+                if (arrp->fromp() != curp || sawSel) {
+                    fp.kind = MixedWrite::WHOLE;
+                    return fp;
+                }
+                AstConst* const idx = VN_CAST(arrp->bitp(), Const);
+                if (!idx) {
+                    fp.kind = MixedWrite::WHOLE;
+                    return fp;
+                }
+                fp.elems.push_back(idx->toUInt());
+                sawArr = true;
+                curp = arrp;
+            } else {
+                break;
+            }
+        }
+        if (bitLo < 0) {
+            fp.kind = MixedWrite::WHOLE;
+            return fp;
+        }
+        if (sawSel) {
+            fp.kind = MixedWrite::BITS;
+            fp.lo = static_cast<uint64_t>(bitLo);
+            fp.hi = fp.lo + bitW;
+        } else if (sawArr) {
+            fp.kind = MixedWrite::ELEMS;
+        }
+        return fp;
+    }
+
+    static bool footprintsOverlap(const MixedWrite& a, const MixedWrite& b) {
+        if (a.kind == MixedWrite::WHOLE || b.kind == MixedWrite::WHOLE) return true;
+        if (a.kind == MixedWrite::BITS && b.kind == MixedWrite::BITS) {
+            return a.lo < b.hi && b.lo < a.hi;
+        }
+        if (a.kind == MixedWrite::ELEMS && b.kind == MixedWrite::ELEMS) {
+            // Overlap unless a differing index proves disjoint elements; a
+            // strict prefix means one side selects a containing sub-array.
+            const size_t n = std::min(a.elems.size(), b.elems.size());
+            for (size_t i = 0; i < n; ++i) {
+                if (a.elems[i] != b.elems[i]) return false;
+            }
+            return true;
+        }
+        return true;  // kind mismatch: cannot prove disjoint
+    }
+
+    void warnMixedWrites(AstVarScope* vscp, const MixedWrite& blk,
+                         const MixedWrite& dly) {
+        const FileLine* const blockingp = blk.assignFl ? blk.assignFl : blk.refFl;
+        const FileLine* const nonblockingp = dly.assignFl ? dly.assignFl : dly.refFl;
+        vscp->v3warn(
+            BLKANDNBLK,
+            "Unsupported: Blocked and non-blocking assignments to same variable: "
+                << vscp->varp()->prettyNameQ() << '\n'
+                << vscp->warnContextPrimary() << '\n'
+                << blockingp->warnOther() << "... Location of blocking assignment\n"
+                << blockingp->warnContextSecondary() << '\n'
+                << nonblockingp->warnOther() << "... Location of nonblocking assignment\n"
+                << nonblockingp->warnContextSecondary());
+    }
+
+    void markVarUsage(AstNodeVarRef* nodep, bool isNba, bool preciseDlyCommit = true) {
         // Ignore if warning is disabled on this reference (used by V3Force).
         if (nodep->fileline()->warnIsOff(V3ErrorCode::BLKANDNBLK)) return;
         if (m_ignoreBlkAndNBlk) return;
-        if (blocking) nodep->user5(true);
-        AstVarScope* const vscp = nodep->varScopep();
-        // UINFO(4, " MVU " << blocking << " " << nodep << endl);
-        const AstNode* const lastrefp = vscp->user5p();
-        if (!lastrefp) {
-            vscp->user5p(nodep);
-        } else {
-            const bool last_was_blocking = lastrefp->user5();
-            if (last_was_blocking != blocking) {
-                const AstNode* nonblockingp = blocking ? nodep : lastrefp;
-                if (const AstNode* np = containingAssignment(nonblockingp)) nonblockingp = np;
-                const AstNode* blockingp = blocking ? lastrefp : nodep;
-                if (const AstNode* np = containingAssignment(blockingp)) blockingp = np;
-                vscp->v3warn(
-                    BLKANDNBLK,
-                    "Unsupported: Blocked and non-blocking assignments to same variable: "
-                        << vscp->varp()->prettyNameQ() << '\n'
-                        << vscp->warnContextPrimary() << '\n'
-                        << blockingp->warnOther() << "... Location of blocking assignment\n"
-                        << blockingp->warnContextSecondary() << '\n'
-                        << nonblockingp->warnOther() << "... Location of nonblocking assignment\n"
-                        << nonblockingp->warnContextSecondary());
+        MixedWrite fp = footprintOf(nodep);
+        fp.isNba = isNba;
+        fp.preciseCommit = preciseDlyCommit;
+        if (isNba && !preciseDlyCommit) {
+            // Full-shadow partial commit: cannot prove which bits the post
+            // commit will touch, so treat the footprint as the whole variable.
+            fp.kind = MixedWrite::WHOLE;
+        }
+        fp.inClocked = m_activep && m_activep->hasClocked();
+        std::vector<MixedWrite>& writes = m_mixedWrites[nodep->varScopep()];
+        // Warn once per variable on the first unsafe blocking/non-blocking
+        // pair. Following the upstream BLKANDNBLK semantics, a pair is unsafe
+        // only when the footprints overlap AND the blocking side is in
+        // combinational logic: there the NBA post-commit can race the
+        // combinational re-evaluation on the same bits. Disjoint footprints
+        // are supported (the commit preserves untouched bits through the
+        // shadow), and blocking writes in clocked/suspendable logic are
+        // ordered before the commit, so they are safe even when overlapping.
+        if (m_warnedMixedWrites.count(nodep->varScopep())) {
+            writes.push_back(std::move(fp));
+            return;
+        }
+        for (const MixedWrite& prev : writes) {
+            if (prev.isNba == isNba) continue;
+            const MixedWrite& blk = isNba ? prev : fp;
+            const MixedWrite& dly = isNba ? fp : prev;
+            if (footprintsOverlap(prev, fp) && (!blk.inClocked || !dly.preciseCommit)) {
+                warnMixedWrites(nodep->varScopep(), isNba ? prev : fp, isNba ? fp : prev);
+                m_warnedMixedWrites.insert(nodep->varScopep());
+                break;
             }
         }
+        writes.push_back(std::move(fp));
     }
     AstVarScope* createVarSc(AstVarScope* oldvarscp, const string& name,
                              int width /*0==fromoldvar*/, AstNodeDType* newdtypep) {
@@ -448,6 +592,12 @@ private:
         if (dimselp) varrefp = VN_AS(dimselp, VarRef);
         UASSERT_OBJ(varrefp, nodep, "No var underneath arraysels");
         UASSERT_OBJ(varrefp->varScopep(), varrefp, "Var didn't get varscoped in V3Scope.cpp");
+        // Record the write for the BLKANDNBLK analysis while the select chain
+        // is still intact. Skip unpacked arrays: their flagged commits are
+        // precise, and historically they were exempt from this warning.
+        if (!VN_IS(varrefp->varScopep()->dtypep()->skipRefp(), UnpackArrayDType)) {
+            markVarUsage(varrefp, true, true);
+        }
         varrefp->unlinkFrBack();
         const AstVar* const oldvarp = varrefp->varp();
         const int modVecNum = m_scopeVecMap[varrefp->varScopep()]++;
@@ -724,10 +874,47 @@ private:
         const bool isArray = VN_IS(nodep->lhsp(), ArraySel)
                              || (VN_IS(nodep->lhsp(), Sel)
                                  && VN_IS(VN_AS(nodep->lhsp(), Sel)->fromp(), ArraySel));
+        // Route compatible packed delayed writes through createDlyOnSet, which
+        // commits only the written select under a flag. This is what makes
+        // mixed blocking/non-blocking writes to disjoint bits safe: the
+        // commit can never clobber bits it did not write. Whole-variable and
+        // nested-select writes keep the shadow-variable scheme; once a
+        // variable uses one scheme its later delayed writes must match.
+        AstVarRef* baseRefp = nullptr;
+        for (AstNodeExpr* selp = nodep->lhsp(); selp;) {
+            if (AstVarRef* const refp = VN_CAST(selp, VarRef)) {
+                baseRefp = refp;
+                break;
+            }
+            if (AstSel* const s = VN_CAST(selp, Sel)) {
+                selp = s->fromp();
+                continue;
+            }
+            if (AstArraySel* const a = VN_CAST(selp, ArraySel)) {
+                selp = a->fromp();
+                continue;
+            }
+            break;
+        }
+        AstVarScope* const wvscp = baseRefp ? baseRefp->varScopep() : nullptr;
+        const bool packedSel = VN_IS(nodep->lhsp(), Sel)
+                               && VN_IS(VN_AS(nodep->lhsp(), Sel)->fromp(), VarRef);
+        const bool onSetCompat = isArray || packedSel || VN_IS(nodep->lhsp(), VarRef);
+        if (wvscp && m_dlyOnSetVars.count(wvscp) && !onSetCompat) {
+            nodep->v3warn(E_UNSUPPORTED,
+                          "Unsupported: Delayed assignment with inconsistent select depth "
+                              "for variable: "
+                              << wvscp->varp()->prettyNameQ());
+        }
+        const bool useOnSet
+            = wvscp
+              && (m_inSuspendableOrFork || isArray || m_dlyOnSetVars.count(wvscp)
+                  || (packedSel && !m_simpleDlyVars.count(wvscp)));
         if (m_inLoop && isArray && !m_inSuspendableOrFork && rewriteLoopQueue(nodep)) {
             return;
         }
-        if (m_inSuspendableOrFork || isArray) {
+        if (useOnSet) {
+            if (wvscp) m_dlyOnSetVars.insert(wvscp);
             AstNodeExpr* const lhsp = nodep->lhsp();
             AstNodeExpr* const newlhsp = createDlyOnSet(nodep, lhsp);
             if (m_inLoop && isArray) {
@@ -746,6 +933,7 @@ private:
             }
             if (!lhsp->backp()) VL_DO_DANGLING(pushDeletep(lhsp), lhsp);
         } else {
+            if (wvscp) m_simpleDlyVars.insert(wvscp);
             iterateChildren(nodep);
         }
     }
@@ -754,7 +942,13 @@ private:
         if (!nodep->user2Inc()) {  // Not done yet
             if (m_inDly && nodep->access().isWriteOrRW()) {
                 UINFO(4, "AssignDlyVar: " << nodep << endl);
-                markVarUsage(nodep, true);
+                // Only a whole-variable LHS gets a precise commit on the
+                // shadow scheme (the NBA value wins on every bit); a partial
+                // select would be committed by a full-variable copy.
+                const AstNode* const assignp = containingAssignment(nodep);
+                const bool wholeLhs = VN_IS(assignp, NodeAssign)
+                                      && VN_AS(assignp, NodeAssign)->lhsp() == nodep;
+                markVarUsage(nodep, true, wholeLhs);
                 UASSERT_OBJ(m_activep, nodep, "<= not under sensitivity block");
                 UASSERT_OBJ(!nodep->access().isRW(), nodep, "<= on read+write method");
                 if (!m_activep->hasClocked()) {

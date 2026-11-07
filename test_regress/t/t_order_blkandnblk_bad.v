@@ -19,7 +19,7 @@ module t (/*AUTOARG*/
    always_comb array[0] = i;
 
    always @ (posedge clk)
-     array[1] <= array[0];
+     array[0] <= array[1];
 
    assign o = array[1];
 
