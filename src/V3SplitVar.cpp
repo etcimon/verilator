@@ -179,6 +179,9 @@ struct SplitVarImpl {
         if (const AstNodeFTask* const taskp = VN_CAST(varp->backp(), NodeFTask)) {
             if (const char* const reason = cannotSplitTaskReason(taskp)) return reason;
         }
+        if (const AstFunc* const funcp = VN_CAST(varp->backp(), Func)) {
+            if (funcp->fvarp() == varp) return "it is a function return value";
+        }
         if (const char* const reason = cannotSplitVarTypeReason(varp->varType())) {
             return reason;
         }
