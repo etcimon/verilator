@@ -123,6 +123,7 @@
 #include <algorithm>  // sort
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1357,12 +1358,44 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
         m_refs.clear();  // Done
     }
 
-    static const AstNodeModule* moduleOf(const AstNode* nodep) {
-        for (const AstNode* p = nodep; p; p = p->backp()) {
-            if (const AstNodeModule* const modp = VN_CAST(p, NodeModule)) return modp;
+    // The split candidates referenced from a module other than the one declaring
+    // them. One top-down walk records each candidate's declaring module, a second
+    // compares it with the module every reference sits in. (Resolving the module
+    // of a reference upwards instead follows backp(), which inside a statement
+    // list is the previous sibling: per reference that is linear in the list, and
+    // after unroll-before-split the lists are long. On the hyp8_mc netlist the
+    // upward form was 38,660 s of a 39,300 s verilation.)
+    class ExternalRefVisitor final : public VNVisitor {
+        const bool m_collect;  // true: record declarations, false: check references
+        std::unordered_map<const AstVar*, const AstNodeModule*>& m_declModp;
+        std::unordered_set<const AstVar*>& m_external;
+        const AstNodeModule* m_modp = nullptr;
+        void visit(AstNodeModule* nodep) override {
+            VL_RESTORER(m_modp);
+            m_modp = nodep;
+            iterateChildren(nodep);
         }
-        return nullptr;
-    }
+        void visit(AstVar* nodep) override {
+            if (m_collect && nodep->attrSplitVar()) m_declModp.emplace(nodep, m_modp);
+            iterateChildren(nodep);
+        }
+        void visit(AstVarRef* nodep) override {
+            if (m_collect) return;
+            const auto it = m_declModp.find(nodep->varp());
+            if (it != m_declModp.end() && it->second != m_modp) m_external.insert(it->first);
+        }
+        void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+    public:
+        ExternalRefVisitor(AstNetlist* netp, bool collect,
+                           std::unordered_map<const AstVar*, const AstNodeModule*>& declModp,
+                           std::unordered_set<const AstVar*>& external)
+            : m_collect{collect}
+            , m_declModp{declModp}
+            , m_external{external} {
+            iterate(netp);
+        }
+    };
 
 public:
     // Walk the tree as it is NOW, instead of visiting AstSel/AstVarRef pointers
@@ -1378,10 +1411,11 @@ public:
         (void)refs;
         std::unordered_set<const AstVar*> external;
         std::set<std::string> xrefNames;
-        nodep->foreach([&](AstVarRef* refp) {
-            AstVar* const varp = refp->varp();
-            if (varp && moduleOf(refp) != moduleOf(varp)) external.insert(varp);
-        });
+        {
+            std::unordered_map<const AstVar*, const AstNodeModule*> declModp;
+            { ExternalRefVisitor{nodep, true, declModp, external}; }
+            { ExternalRefVisitor{nodep, false, declModp, external}; }
+        }
         nodep->foreach([&](AstVarXRef* xrefp) {
             xrefNames.insert(xrefp->name());
             if (AstVar* const varp = xrefp->varp()) external.insert(varp);
