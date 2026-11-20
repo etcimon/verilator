@@ -844,6 +844,11 @@ class PrioVisitor final : public VNVisitor {
     bool tryOrAccumulate(AstWhile* nodep) {
         UpCount up;
         if (!matchUpCount(nodep, up, kMaxAccWidth) || up.blockp) return false;
+        // Loops V3Unroll can fully unroll become branch-predictable
+        // straight-line code; measured faster than the serial ctz chain
+        // emitted here (hyp8 fw_payload/zkn_kat A/B). Only fire where
+        // unrolling cannot: trips beyond --unroll-count.
+        if (up.trips <= v3Global.opt.unrollCount()) return false;
         AstNode* const body = unwrapBegin(nodep->stmtsp());
         if (!body || body->nextp()) return false;
         AstIf* const ifp = VN_CAST(body, If);
