@@ -375,6 +375,11 @@ private:
     // 51 lzc lowerings and one wakeup index are not on the critical path.
     bool m_fPrio = false;  // -fprio: ctz lowering of lzc / grant (opt-in)
     bool m_fPrioOrAcc = false;  // -fprio-oracc: if-OR-accumulate -> onehot+ctz (opt-in)
+    // -fcase-table: constant-result case -> ConstPool lookup (opt-in). Measured on
+    // hyp8 (fw_payload nopgo, identical retired work): +38 % instructions and
+    // +55 % cycles vs the compare-tree form -- hot decode cases predict well as
+    // branches, and the load+index form costs more dynamic work than it saves.
+    bool m_fCaseTable = false;  // -fcase-table
     bool m_fSoa = false;  // -fsoa: element tables for packed arrays (opt-in)
     bool m_fWake = false;  // -fwake: inverted tag wakeup table (opt-in)
     // Opt-in (not part of -O<n>): -fclock-skip memoizes per-instance combinational
@@ -660,6 +665,7 @@ public:
     bool fReloop() const { return m_fReloop; }
     bool fPrio() const { return m_fPrio; }
     bool fPrioOrAcc() const { return m_fPrioOrAcc; }
+    bool fCaseTable() const { return m_fCaseTable; }
     bool fSoa() const { return m_fSoa; }
     bool fWake() const { return m_fWake; }
     bool fClockSkip() const { return m_fClockSkip; }

@@ -1237,6 +1237,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-freloop", FOnOff, &m_fReloop);
     DECL_OPTION("-fprio", FOnOff, &m_fPrio);
     DECL_OPTION("-fprio-oracc", FOnOff, &m_fPrioOrAcc);
+    DECL_OPTION("-fcase-table", FOnOff, &m_fCaseTable);
     DECL_OPTION("-fsoa", FOnOff, &m_fSoa);
     DECL_OPTION("-fwake", FOnOff, &m_fWake);
     DECL_OPTION("-fclock-skip", FOnOff, &m_fClockSkip);

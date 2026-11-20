@@ -758,7 +758,7 @@ private:
         V3Case::caseLint(nodep);
         iterateChildren(nodep);
         if (debug() >= 9) nodep->dumpTree("-  case_old: ");
-        if (tryCaseTable(nodep)) {
+        if (v3Global.opt.fCaseTable() && tryCaseTable(nodep)) {
             ++m_statCaseTable;
             return;
         }
