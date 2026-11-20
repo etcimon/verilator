@@ -374,6 +374,7 @@ private:
     // are ports, split_var targets or whole-entry reads, so SoA never reaches them;
     // 51 lzc lowerings and one wakeup index are not on the critical path.
     bool m_fPrio = false;  // -fprio: ctz lowering of lzc / grant (opt-in)
+    bool m_fPrioOrAcc = false;  // -fprio-oracc: if-OR-accumulate -> onehot+ctz (opt-in)
     bool m_fSoa = false;  // -fsoa: element tables for packed arrays (opt-in)
     bool m_fWake = false;  // -fwake: inverted tag wakeup table (opt-in)
     // Opt-in (not part of -O<n>): -fclock-skip memoizes per-instance combinational
@@ -658,6 +659,7 @@ public:
     bool fMergeConstPool() const { return m_fMergeConstPool; }
     bool fReloop() const { return m_fReloop; }
     bool fPrio() const { return m_fPrio; }
+    bool fPrioOrAcc() const { return m_fPrioOrAcc; }
     bool fSoa() const { return m_fSoa; }
     bool fWake() const { return m_fWake; }
     bool fClockSkip() const { return m_fClockSkip; }

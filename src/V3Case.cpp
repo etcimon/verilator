@@ -44,6 +44,7 @@
 #include "V3Stats.h"
 
 #include <algorithm>
+#include <map>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -117,6 +118,37 @@ public:
 };
 
 //######################################################################
+// Case-to-table lowering
+//
+// A case whose index expression is narrow and whose every arm produces the
+// same kind of constant result is a read-only lookup. Lower it to one
+// AstConstPool table (deduplicated across the whole design by
+// AstConstPool::findTable) plus a single AstArraySel, instead of the
+// compare tree replaceCaseFast/replaceCaseComplicated would build -- and
+// instead of that tree being cloned into every V3Task inline site.
+//
+// Recognized arm shapes (exactly one effective statement per arm):
+//   - <lhs> = const          blocking or nonblocking, same lhs on every arm
+//   - return const           inside a function; kept as 'return TABLE[idx]'
+// A default arm supplies the value for every uncovered index; without one
+// the arms must provably cover all 2^indexWidth patterns.
+
+static constexpr int kCaseTableMaxIndexWidth = 12;  // 4096 entries max
+static constexpr int kCaseTableMaxValueWidth = 32;
+static constexpr int kCaseTableMinArms = 8;  // distinct index values
+
+// Const node only -- no cast peeling. A constant hidden under a cast has
+// already been folded by V3Const; anything else is left to the tree path.
+static AstConst* caseTableConst(AstNodeExpr* nodep) {
+    return VN_CAST(nodep, Const);
+}
+
+static bool caseTablePlainConst(AstConst* constp) {
+    return constp && !constp->num().isFourState() && !constp->num().isDouble()
+           && !constp->num().isString();
+}
+
+//######################################################################
 // Case state, as a visitor of each AstNode
 
 class CaseVisitor final : public VNVisitor {
@@ -129,7 +161,9 @@ private:
     // STATE
     VDouble0 m_statCaseFast;  // Statistic tracking
     VDouble0 m_statCaseSlow;  // Statistic tracking
+    VDouble0 m_statCaseTable;  // Statistic tracking
     const AstNode* m_alwaysp = nullptr;  // Always in which case is located
+    AstNodeFTask* m_ftaskp = nullptr;  // Function/task containing the case, if any
 
     // Per-CASE
     int m_caseWidth = 0;  // Width of valueItems
@@ -525,11 +559,209 @@ private:
         return false;
     }
 
+    // True when jumpGp targets a function-exit label: V3LinkJump places
+    // 'return' labels in JumpBlocks nested directly under the function
+    // body, while break/continue labels live under loop nodes. Walk the
+    // label's block chain upward; only JumpBlock/JumpLabel nesting may
+    // intervene before reaching the function.
+    bool isFuncExitJump(const AstJumpGo* jumpGp, const AstNodeFTask* ftaskp) {
+        const AstJumpLabel* const labelp = jumpGp->labelp();
+        if (!labelp || !labelp->blockp()) return false;
+        for (const AstNode* p = labelp->blockp(); p;) {
+            if (p == ftaskp) return true;
+            if (!VN_IS(p, JumpBlock) && !VN_IS(p, JumpLabel)) return false;
+            // Ascend to the true parent: backp() of a mid-list node is the
+            // previous sibling, so walk back to the list head first whose
+            // backp() is the owning node.
+            const AstNode* q = p;
+            while (q->backp() && q->backp()->nextp() == q) q = q->backp();
+            p = q->backp();
+        }
+        return false;
+    }
+
+    // Try to lower the case to a ConstPool lookup table. Returns true when
+    // nodep was replaced (and deleted); the caller must not touch it then.
+    bool tryCaseTable(AstCase* nodep) {
+        if (nodep->casex() || nodep->casez() || nodep->caseInside()) return false;
+        if (nodep->notParallelp()) return false;  // Keep the assertion block
+        if (m_ftaskp && (m_ftaskp->dpiImport() || m_ftaskp->classMethod()
+                         || m_ftaskp->recursive() || m_ftaskp->isConstructor())) {
+            return false;  // Non-inlined bodies get their own CFunc emission
+        }
+        AstNodeExpr* const exprp = nodep->exprp();
+        const int indexWidth = exprp ? exprp->width() : 0;
+        if (indexWidth < 2 || indexWidth > kCaseTableMaxIndexWidth) return false;
+
+        enum ArmKind : uint8_t { kNone, kAssign, kAssignDly, kReturn, kReturnGo };
+        ArmKind kind = kNone;
+        AstNodeExpr* lhsp = nullptr;  // Exemplar lhs for assign arms
+        AstConst* defaultValp = nullptr;  // Default arm's value (in-tree)
+        AstJumpGo* firstJumpGp = nullptr;  // Shared function-exit jump
+        int valueWidth = 0;
+        std::map<uint32_t, AstConst*> values;
+        size_t nArms = 0;
+
+        for (AstCaseItem* itemp = nodep->itemsp(); itemp;
+             itemp = VN_AS(itemp->nextp(), CaseItem)) {
+            // One or two effective statements, through single-statement
+            // begins. A trailing JumpGo is the lowered form of 'return
+            // expr': V3LinkJump rewrites it to "assign the function return
+            // variable; goto the function exit" long before this pass.
+            AstNode* stmtp = itemp->stmtsp();
+            AstNode* const outerp = stmtp;  // Node whose nextp is the 2nd stmt
+            while (AstBegin* const begp = VN_CAST(stmtp, Begin)) {
+                if (!begp->stmtsp() || begp->stmtsp()->nextp()) return false;
+                stmtp = begp->stmtsp();
+            }
+            if (!stmtp) return false;
+            AstNode* const secondp = outerp->nextp();
+            AstJumpGo* const jumpGp = VN_CAST(secondp, JumpGo);
+            if (secondp && !jumpGp) return false;
+            if (jumpGp && jumpGp->nextp()) return false;
+
+            AstConst* valp = nullptr;
+            AstNodeExpr* thisLhs = nullptr;
+            ArmKind thisKind = kNone;
+            if (AstAssign* const assignp = VN_CAST(stmtp, Assign)) {
+                thisKind = kAssign;
+                thisLhs = assignp->lhsp();
+                valp = caseTableConst(assignp->rhsp());
+            } else if (AstAssignDly* const assignp = VN_CAST(stmtp, AssignDly)) {
+                thisKind = kAssignDly;
+                thisLhs = assignp->lhsp();
+                valp = caseTableConst(assignp->rhsp());
+            } else if (AstReturn* const retp = VN_CAST(stmtp, Return)) {
+                thisKind = kReturn;
+                if (retp->lhsp()) valp = caseTableConst(retp->lhsp());
+            } else {
+                return false;
+            }
+            if (jumpGp) {
+                // 'return expr' shape: blocking assign to the function
+                // return variable, then a jump to the function exit.
+                // V3LinkJump wraps the whole body per return, so each arm
+                // may target a different AstJumpLabel -- but every label
+                // sits at the end of a singly-nested JumpBlock chain that
+                // converges on the function epilogue, so they are all
+                // semantically the same exit. Any one of them works.
+                if (thisKind != kAssign || !m_ftaskp || !m_ftaskp->isFunction()) {
+                    return false;
+                }
+                const AstVar* const fvarp = VN_CAST(m_ftaskp->fvarp(), Var);
+                const AstVarRef* const lhsRefp = VN_CAST(thisLhs, VarRef);
+                if (!fvarp || !lhsRefp || lhsRefp->varp() != fvarp) return false;
+                if (!isFuncExitJump(jumpGp, m_ftaskp)) return false;
+                if (!firstJumpGp) firstJumpGp = jumpGp;
+                thisKind = kReturnGo;
+            }
+            if (!caseTablePlainConst(valp)) return false;
+            if (valueWidth == 0) {
+                valueWidth = valp->width();
+            } else if (valp->width() != valueWidth) {
+                return false;
+            }
+            if (kind == kNone) {
+                kind = thisKind;
+                lhsp = thisLhs;
+            } else if (thisKind != kind) {
+                return false;
+            }
+            if (thisLhs && lhsp && !thisLhs->sameTree(lhsp)) return false;
+            if (thisLhs && !lhsp) return false;
+            ++nArms;
+
+            if (itemp->isDefault()) {
+                if (defaultValp) return false;
+                defaultValp = valp;
+                continue;
+            }
+            bool anyLabel = false;
+            for (AstNode* condp = itemp->condsp(); condp; condp = condp->nextp()) {
+                AstNodeExpr* const cexprp = VN_CAST(condp, NodeExpr);
+                AstConst* const labelp = cexprp ? caseTableConst(cexprp) : nullptr;
+                if (!caseTablePlainConst(labelp) || labelp->width() != indexWidth) {
+                    return false;
+                }
+                if (!values.emplace(labelp->toUInt(), valp).second) {
+                    return false;  // Duplicate label: keep overlap lint
+                }
+                anyLabel = true;
+            }
+            if (!anyLabel) return false;  // Non-default item with no labels
+        }
+        if (kind == kNone || nArms == 0 || values.size() < kCaseTableMinArms) return false;
+        const uint32_t tableSize = 1u << indexWidth;
+        if (!defaultValp && values.size() != tableSize) return false;
+
+        // The table element must be exactly the assignment/return target
+        // width: a narrower element would be zero-extended where the
+        // original constant might have been sign-extended.
+        int targetWidth = 0;
+        if (kind == kReturn || kind == kReturnGo) {
+            // 'return' arms keep their AstReturn / exit-jump form, so no
+            // tail-position requirement -- but they must live in a function
+            // whose return variable width matches the arm constants.
+            if (!m_ftaskp || !m_ftaskp->isFunction()) return false;
+            const AstVar* const fvarp = VN_CAST(m_ftaskp->fvarp(), Var);
+            if (!fvarp) return false;
+            targetWidth = fvarp->width();
+        } else {
+            targetWidth = lhsp->width();
+        }
+        if (valueWidth != targetWidth || valueWidth > kCaseTableMaxValueWidth) return false;
+
+        // Build the ConstPool table. The initializer is cloned into the pool
+        // entry by findTable; initp stays ours to delete either way.
+        FileLine* const fl = nodep->fileline();
+        AstNodeDType* const elemDTypep
+            = nodep->findBitDType(valueWidth, valueWidth, VSigning::UNSIGNED);
+        AstUnpackArrayDType* const tableDTypep = new AstUnpackArrayDType{
+            fl, elemDTypep, new AstRange{fl, static_cast<int>(tableSize) - 1, 0}};
+        v3Global.rootp()->typeTablep()->addTypesp(tableDTypep);
+        AstNodeExpr* const defaultExprp
+            = defaultValp ? static_cast<AstNodeExpr*>(defaultValp->cloneTree(false))
+                          : static_cast<AstNodeExpr*>(
+                              new AstConst{fl, AstConst::WidthedValue{}, valueWidth, 0});
+        AstInitArray* const initp = new AstInitArray{fl, tableDTypep, defaultExprp};
+        for (const auto& pair : values) {
+            initp->addIndexValuep(pair.first, new AstConst{fl, pair.second->num()});
+        }
+        AstVarScope* const tableVscp = v3Global.rootp()->constPoolp()->findTable(initp);
+        initp->deleteTree();
+
+        AstNodeExpr* const newRhs
+            = new AstArraySel{fl, new AstVarRef{fl, tableVscp, VAccess::READ},
+                              exprp->cloneTree(false)};
+        AstNode* newStmtp = nullptr;
+        if (kind == kReturn) {
+            newStmtp = new AstReturn{fl, newRhs};
+        } else if (kind == kReturnGo) {
+            // Assign the return variable from the table, then keep the
+            // shared function-exit jump so 'return' semantics are preserved.
+            newStmtp = new AstAssign{fl, lhsp->cloneTree(false), newRhs};
+            newStmtp->addNext(firstJumpGp->cloneTree(false));
+        } else if (kind == kAssignDly) {
+            newStmtp = new AstAssignDly{fl, lhsp->cloneTree(false), newRhs};
+        } else {
+            newStmtp = new AstAssign{fl, lhsp->cloneTree(false), newRhs};
+        }
+        nodep->replaceWith(newStmtp);
+        VL_DO_DANGLING(nodep->deleteTree(), nodep);
+        UINFO(4, "  Case table " << tableVscp->varp()->name() << " idxw" << indexWidth
+                                 << " arms" << nArms << endl);
+        return true;
+    }
+
     // VISITORS
     void visit(AstCase* nodep) override {
         V3Case::caseLint(nodep);
         iterateChildren(nodep);
         if (debug() >= 9) nodep->dumpTree("-  case_old: ");
+        if (tryCaseTable(nodep)) {
+            ++m_statCaseTable;
+            return;
+        }
         if (isCaseTreeFast(nodep) && v3Global.opt.fCase()) {
             // It's a simple priority encoder or complete statement
             // we can make a tree of statements to avoid extra comparisons
@@ -543,6 +775,11 @@ private:
         }
     }
     //--------------------
+    void visit(AstNodeFTask* nodep) override {
+        VL_RESTORER(m_ftaskp);
+        m_ftaskp = nodep;
+        iterateChildren(nodep);
+    }
     void visit(AstNode* nodep) override {
         if (VN_IS(nodep, Always)) m_alwaysp = nodep;
         iterateChildren(nodep);
@@ -557,6 +794,7 @@ public:
     ~CaseVisitor() override {
         V3Stats::addStat("Optimizations, Cases parallelized", m_statCaseFast);
         V3Stats::addStat("Optimizations, Cases complex", m_statCaseSlow);
+        V3Stats::addStat("Optimizations, Cases to lookup tables", m_statCaseTable);
     }
 };
 

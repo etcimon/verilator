@@ -245,7 +245,13 @@ static void process() {
         // them so they stay one loop over the table instead of N copies of the body.
         // Priority encoders run first: lzc index arrays are still packed selects,
         // and a find-first / grant loop is still a loop rather than N bit tests.
-        if (v3Global.opt.fPrio()) V3Prio::prioAll(v3Global.rootp());
+        if (v3Global.opt.fPrio()) {
+            V3Prio::prioAll(v3Global.rootp());
+        } else if (v3Global.opt.fPrioOrAcc()) {
+            // Or-accumulate alone: exact-fallback lowering, decoupled from the
+            // measured-negative -fprio bundle so it can be A/B'd on its own.
+            V3Prio::prioOrAccAll(v3Global.rootp());
+        }
         if (v3Global.opt.fSoa()) V3Soa::soaAll(v3Global.rootp());
         // Wakeup compares are still loops here. A small tag (a physical
         // register number) becomes a waiter bitmask so each writeback is one

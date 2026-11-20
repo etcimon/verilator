@@ -54,6 +54,8 @@ namespace {
 
 constexpr int kMaxWidth = 64;
 constexpr int kMaxDepth = 96;
+constexpr int kMaxAccWidth = 4096;  // Mask bits for or-accumulate lowering
+constexpr int kMinAccTrips = 8;  // Fewer loop iterations stay a plain loop
 
 struct Loc final {
     AstVar* varp = nullptr;
@@ -224,6 +226,38 @@ const char* ctzName(int width) { return width <= 32 ? "VL_LZC_CTZ_I" : "VL_LZC_C
 const char* clzName(int width) { return width <= 32 ? "VL_LZC_CLZ_I" : "VL_LZC_CLZ_Q"; }
 const char* onehotName(int width) { return width <= 32 ? "VL_LSBONEHOT_I" : "VL_LSBONEHOT_Q"; }
 int callWidth(int width) { return width <= 32 ? 32 : 64; }
+
+// hostCall variant for the *_W helpers whose signature is (word count, data).
+AstNodeExpr* hostCallWI(FileLine* fl, const char* fname, uint32_t words, AstVar* varp,
+                       int resultWidth, int destWidth) {
+    AstNode* const headp = new AstText{fl, std::string{fname} + "(", true};
+    headp->addNext(new AstConst{fl, AstConst::WidthedValue{}, 32, words});
+    headp->addNext(new AstText{fl, ", ", true});
+    headp->addNext(new AstVarRef{fl, varp, VAccess::READ});
+    headp->addNext(new AstText{fl, ")", true});
+    AstCExpr* const cexprp = new AstCExpr{fl, headp};
+    cexprp->dtypeSetLogicSized(resultWidth, VSigning::UNSIGNED);
+    cexprp->pure(true);
+    cexprp->protect(false);
+    if (destWidth == resultWidth) return cexprp;
+    return new AstCCast{fl, cexprp, destWidth, destWidth};
+}
+
+// "At most one bit set" test and lowest-set-bit index for a mask of any
+// width. Scalar helpers take the vector by value; past 64 bits the _W
+// helpers take the EData word count and a data pointer (VlWide converts).
+AstNodeExpr* onehot0Any(FileLine* fl, int width, AstVar* vecp) {
+    if (width <= 32) return hostCall(fl, "VL_ONEHOT0_I", vecp, false, 0, 32, 32);
+    if (width <= 64) return hostCall(fl, "VL_ONEHOT0_Q", vecp, false, 0, 32, 32);
+    return hostCallWI(fl, "VL_ONEHOT0_W", static_cast<uint32_t>((width + 31) / 32), vecp, 32,
+                      32);
+}
+AstNodeExpr* ctzAny(FileLine* fl, int width, AstVar* vecp, int destWidth) {
+    if (width <= 32) return hostCall(fl, "VL_CTZ_I", vecp, false, 0, 32, destWidth);
+    if (width <= 64) return hostCall(fl, "VL_CTZ_Q", vecp, false, 0, 32, destWidth);
+    return hostCallWI(fl, "VL_CTZ_W", static_cast<uint32_t>((width + 31) / 32), vecp, 32,
+                      destWidth);
+}
 
 class PrioVisitor final : public VNVisitor {
     struct RhsRep final {
@@ -462,7 +496,7 @@ class PrioVisitor final : public VNVisitor {
         return true;
     }
 
-    bool matchUpCount(AstWhile* nodep, UpCount& out) {
+    bool matchUpCount(AstWhile* nodep, UpCount& out, uint32_t maxTrips = kMaxWidth) {
         AstNode* place = nodep;
         if (AstJumpBlock* const blockp = VN_CAST(nodep->backp(), JumpBlock)) {
             if (blockp->stmtsp() != nodep) return false;
@@ -509,7 +543,7 @@ class PrioVisitor final : public VNVisitor {
         }
         if (peelVar(varSide) != idx) return false;
         uint32_t bound = 0;
-        if (!constUInt(boundSide, bound) || bound < 1 || bound > static_cast<uint32_t>(kMaxWidth)) {
+        if (!constUInt(boundSide, bound) || bound < 1 || bound > maxTrips) {
             return false;
         }
         out.idx = idx;
@@ -552,6 +586,128 @@ class PrioVisitor final : public VNVisitor {
             }
         }
         return false;
+    }
+
+    // ---- or-accumulate bit-test matching --------------------------------
+    // V3Width rewrites two idioms this transform must see through:
+    //   * W'(i) size casts become SEL(i, 0, w) truncations
+    //   * vec[i] with a dynamic index becomes AND(rangeGuard, SEL(vec,i,1))
+    // A truncated index is only safe when 2^w >= vecWidth, so i < vecWidth
+    // iterations can never wrap the select.
+
+    // expr denotes the loop index, possibly through SEL(idx,0,w).
+    // *selWid gets the select width (0 for a bare VarRef).
+    AstVar* idxExprVar(AstNodeExpr* expr, AstVar* idx, uint32_t* selWid) {
+        expr = peelCast(expr);
+        if (AstVarRef* const refp = VN_CAST(expr, VarRef)) {
+            if (refp->varp() == idx) {
+                *selWid = 0;
+                return idx;
+            }
+            return nullptr;
+        }
+        AstSel* const selp = VN_CAST(expr, Sel);
+        if (!selp) return nullptr;
+        uint32_t lsb = 0, wid = 0;
+        if (!constUInt(selp->lsbp(), lsb) || lsb != 0) return nullptr;
+        if (!constUInt(selp->widthp(), wid)) return nullptr;
+        AstVarRef* const refp = VN_CAST(peelCast(selp->fromp()), VarRef);
+        if (!refp || refp->varp() != idx) return nullptr;
+        *selWid = wid;
+        return idx;
+    }
+
+    // A w-bit truncation of the index cannot alias for i < limit.
+    static bool idxWideEnough(uint32_t selWid, uint32_t limit) {
+        return selWid == 0 || selWid >= 32 || (1u << selWid) >= limit;
+    }
+
+    // Core `vec[lsb]` one-bit select, through ==1 / !=0 wrappers. Fills
+    // vecp and returns the raw index expression, or nullptr.
+    AstNodeExpr* matchVecBitSel(AstNodeExpr* expr, AstVar*& vecp) {
+        expr = peelCast(expr);
+        if (AstEq* const eqp = VN_CAST(expr, Eq)) {
+            if (eqp->rhsp()->isOne()) return matchVecBitSel(eqp->lhsp(), vecp);
+            if (eqp->lhsp()->isOne()) return matchVecBitSel(eqp->rhsp(), vecp);
+            return nullptr;
+        }
+        if (AstNeq* const neqp = VN_CAST(expr, Neq)) {
+            if (neqp->rhsp()->isZero()) return matchVecBitSel(neqp->lhsp(), vecp);
+            if (neqp->lhsp()->isZero()) return matchVecBitSel(neqp->rhsp(), vecp);
+            return nullptr;
+        }
+        AstSel* const selp = VN_CAST(expr, Sel);
+        if (!selp) return nullptr;
+        uint32_t wid = 0;
+        if (!constUInt(selp->widthp(), wid) || wid != 1) return nullptr;
+        AstVarRef* const refp = VN_CAST(peelCast(selp->fromp()), VarRef);
+        if (!refp || !refp->varp()) return nullptr;
+        vecp = refp->varp();
+        return selp->lsbp();
+    }
+
+    // True when expr is an upper-bound comparison that holds for every
+    // i in [0, vecWidth): C >= idx / idx <= C style guards (unsigned).
+    bool isRangeGuard(AstNodeExpr* expr, AstVar* idx, uint32_t vecWidth) {
+        expr = peelCast(expr);
+        if (AstAnd* const andp = VN_CAST(expr, And)) {
+            return isRangeGuard(andp->lhsp(), idx, vecWidth)
+                   && isRangeGuard(andp->rhsp(), idx, vecWidth);
+        }
+        uint32_t cval = 0, wid = 0;
+        if (AstLt* const p = VN_CAST(expr, Lt)) {
+            if (!idxExprVar(p->lhsp(), idx, &wid) || !idxWideEnough(wid, vecWidth)) {
+                return false;
+            }
+            return constUInt(p->rhsp(), cval) && cval >= vecWidth;
+        }
+        if (AstLte* const p = VN_CAST(expr, Lte)) {
+            if (!idxExprVar(p->lhsp(), idx, &wid) || !idxWideEnough(wid, vecWidth)) {
+                return false;
+            }
+            return constUInt(p->rhsp(), cval) && cval + 1 >= vecWidth;
+        }
+        if (AstGt* const p = VN_CAST(expr, Gt)) {
+            if (!idxExprVar(p->rhsp(), idx, &wid) || !idxWideEnough(wid, vecWidth)) {
+                return false;
+            }
+            return constUInt(p->lhsp(), cval) && cval >= vecWidth;
+        }
+        if (AstGte* const p = VN_CAST(expr, Gte)) {
+            if (!idxExprVar(p->rhsp(), idx, &wid) || !idxWideEnough(wid, vecWidth)) {
+                return false;
+            }
+            return constUInt(p->lhsp(), cval) && cval + 1 >= vecWidth;
+        }
+        return false;
+    }
+
+    // Match `vec[idx]` as a one-bit test, seeing through the V3Width
+    // AND(rangeGuard, sel) wrapper and SEL(idx,0,w) index truncation.
+    // Lsb-order scans only; the or-accumulate ctz form needs bit i.
+    bool bitScanAcc(AstNodeExpr* expr, AstVar* idx, AstVar*& vecp) {
+        expr = peelCast(expr);
+        if (AstAnd* const andp = VN_CAST(expr, And)) {
+            for (int side = 0; side < 2; ++side) {
+                AstVar* candp = nullptr;
+                AstNodeExpr* const candLsb
+                    = matchVecBitSel(side ? andp->lhsp() : andp->rhsp(), candp);
+                if (!candLsb || !candp) continue;
+                AstNodeExpr* const guardSide = side ? andp->rhsp() : andp->lhsp();
+                if (!isRangeGuard(guardSide, idx, candp->width())) continue;
+                uint32_t selWid = 0;
+                if (idxExprVar(candLsb, idx, &selWid)
+                    && idxWideEnough(selWid, candp->width())) {
+                    vecp = candp;
+                    return true;
+                }
+            }
+            return false;
+        }
+        AstNodeExpr* const lsbp = matchVecBitSel(expr, vecp);
+        if (!lsbp || !vecp) return false;
+        uint32_t selWid = 0;
+        return idxExprVar(lsbp, idx, &selWid) && idxWideEnough(selWid, vecp->width());
     }
 
     bool tryFind(AstWhile* nodep) {
@@ -678,25 +834,95 @@ class PrioVisitor final : public VNVisitor {
         return true;
     }
 
-    void lower() {
-        for (AstAssignW* const assignp : m_assigns) {
-            if (tryEmpty(assignp)) continue;
-            tryTree(assignp);
+    // for (i = 0; i < N; i++) if (vec[i]) acc = acc | i;
+    // The loop ORs the index of every set mask bit into acc. When the mask
+    // is one-hot-or-empty -- the common case for pick-one request masks --
+    // the result is the index of the single set bit, which is exactly
+    // ctz(vec) (and ctz of an empty mask is 0, matching the untouched acc).
+    // Guard the loop with a one-hot test and keep the original loop as the
+    // else branch, so multi-bit masks keep bit-identical results.
+    bool tryOrAccumulate(AstWhile* nodep) {
+        UpCount up;
+        if (!matchUpCount(nodep, up, kMaxAccWidth) || up.blockp) return false;
+        AstNode* const body = unwrapBegin(nodep->stmtsp());
+        if (!body || body->nextp()) return false;
+        AstIf* const ifp = VN_CAST(body, If);
+        if (!ifp || ifp->elsesp()) return false;
+        AstVar* vecp = nullptr;
+        if (!bitScanAcc(ifp->condp(), up.idx, vecp) || !vecp) return false;
+        const int width = vecp->width();
+        if (width != up.trips || up.trips < kMinAccTrips) return false;
+        AstNode* const then = unwrapBegin(ifp->thensp());
+        if (!then || then->nextp()) return false;
+        AstAssign* const asgp = VN_CAST(then, Assign);
+        if (!asgp) return false;
+        // lhs must be a plain variable (a part-select would change width)
+        AstVarRef* const accRef = VN_CAST(peelCast(asgp->lhsp()), VarRef);
+        if (!accRef || !accRef->varp()) return false;
+        AstVar* const acc = accRef->varp();
+        // rhs must be acc | idx or idx | acc. The index side may be the
+        // SEL(idx,0,w) form V3Width emits for W'(i); it must be wide enough
+        // that i < width cannot wrap.
+        AstOr* const orp = VN_CAST(peelCast(asgp->rhsp()), Or);
+        if (!orp) return false;
+        auto accIdx = [&](AstNodeExpr* accp, AstNodeExpr* idxp) {
+            AstVarRef* const ar = VN_CAST(peelCast(accp), VarRef);
+            uint32_t selWid = 0;
+            return ar && ar->varp() == acc && idxExprVar(idxp, up.idx, &selWid)
+                   && idxWideEnough(selWid, width);
+        };
+        if (!accIdx(orp->lhsp(), orp->rhsp()) && !accIdx(orp->rhsp(), orp->lhsp())) {
+            return false;
         }
-        for (const RhsRep& rep : m_reps) {
-            AstNodeExpr* const oldp = rep.assignp->rhsp();
-            oldp->replaceWith(rep.rhsp);
-            VL_DO_DANGLING(oldp->deleteTree(), oldp);
-            ++m_lowered;
+        FileLine* const fl = nodep->fileline();
+        const int outWidth = acc->width();
+        if (outWidth < 1 || outWidth > 64) return false;
+        // acc = acc | ctz(vec): for a one-hot mask this is acc | index, and
+        // for an empty mask ctz is 0 so acc is unchanged -- matching the
+        // loop, which would have left acc at its pre-loop value.
+        AstNodeExpr* const ctzp = ctzAny(fl, width, vecp, outWidth);
+        AstOr* const newOrp = new AstOr{fl, new AstVarRef{fl, acc, VAccess::READ}, ctzp};
+        newOrp->dtypeSetLogicSized(outWidth, VSigning::UNSIGNED);
+        AstAssign* const fastp
+            = new AstAssign{fl, new AstVarRef{fl, acc, VAccess::WRITE}, newOrp};
+        AstIf* const guardp = new AstIf{fl, onehot0Any(fl, width, vecp)};
+        guardp->addThensp(fastp);
+        VNRelinker relinker;
+        nodep->unlinkFrBack(&relinker);
+        guardp->addElsesp(nodep);
+        relinker.relink(guardp);
+        ++m_lowered;
+        UINFO(4, "  Prio or-accumulate " << vecp->prettyNameQ() << " w" << width << endl);
+        return true;
+    }
+
+    void lower() {
+        if (!m_oraccOnly) {
+            for (AstAssignW* const assignp : m_assigns) {
+                if (tryEmpty(assignp)) continue;
+                tryTree(assignp);
+            }
+            for (const RhsRep& rep : m_reps) {
+                AstNodeExpr* const oldp = rep.assignp->rhsp();
+                oldp->replaceWith(rep.rhsp);
+                VL_DO_DANGLING(oldp->deleteTree(), oldp);
+                ++m_lowered;
+            }
         }
         for (AstWhile* const whilep : m_whiles) {
-            if (tryFind(whilep)) continue;
-            tryGrant(whilep);
+            if (!m_oraccOnly) {
+                if (tryFind(whilep)) continue;
+                if (tryGrant(whilep)) continue;
+            }
+            tryOrAccumulate(whilep);
         }
     }
 
+    const bool m_oraccOnly;
+
 public:
-    explicit PrioVisitor(AstNetlist* nodep) {
+    explicit PrioVisitor(AstNetlist* nodep, bool oraccOnly = false)
+        : m_oraccOnly{oraccOnly} {
         iterate(nodep);
         lower();
     }
@@ -730,4 +956,10 @@ void V3Prio::prioAll(AstNetlist* nodep) {
     UINFO(2, __FUNCTION__ << ": " << endl);
     { PrioVisitor{nodep}; }
     V3Global::dumpCheckGlobalTree("prio", 0, dumpTree() >= 6);
+}
+
+void V3Prio::prioOrAccAll(AstNetlist* nodep) {
+    UINFO(2, __FUNCTION__ << ": " << endl);
+    { PrioVisitor{nodep, true}; }
+    V3Global::dumpCheckGlobalTree("prio-oracc", 0, dumpTree() >= 6);
 }

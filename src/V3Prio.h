@@ -28,6 +28,10 @@ class V3Prio final {
 public:
     // Lower find-first / lzc trees and LSB grant loops to VL_LZC_* / VL_LSBONEHOT_*.
     static void prioAll(AstNetlist* nodep);
+    // Only the if-OR-accumulate -> one-hot guard + ctz lowering; the rest of
+    // prioAll's transforms stay under -fprio. Exact-fallback, opt-in via
+    // -fprio-oracc so it can be A/B'd without the measured-negative bundle.
+    static void prioOrAccAll(AstNetlist* nodep);
 };
 
 #endif
