@@ -131,20 +131,40 @@ public:
 // 16 words cover 1024 tasks, which is finer than the default partition.
 class VlMTaskDoneMask final {
     static constexpr unsigned WORDS = 16;
+    // Yield-spin budget before a long dependency wait drops to a condition
+    // variable sleep. Each yield cycle is VL_LOCK_SPINS pause iterations, so
+    // this is ~4x50K spins (~0.1-0.3 ms) of low-latency polling before the
+    // worker stops burning a core. signal() wakes sleepers; the predicate
+    // re-check keeps missed/spurious notifications correct.
+    static constexpr unsigned SLEEP_AFTER_YIELDS = 4;
 
     std::atomic<uint64_t> m_word[WORDS];
+    mutable std::mutex m_mutex;
+    mutable std::condition_variable m_cv;
+    mutable std::atomic<unsigned> m_waiters;
 
     bool wordReady(unsigned word, bool evenCycle, uint64_t pred) const {
         const uint64_t got = m_word[word].load(std::memory_order_acquire);
         return evenCycle ? ((got & pred) == pred) : ((got & pred) == 0);
     }
+    void blockUntilReady(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
+        std::unique_lock<std::mutex> lock{m_mutex};
+        ++m_waiters;
+        m_cv.wait(lock, [&] { return ready(evenCycle, predp, nWords); });
+        --m_waiters;
+    }
     void spinUntil(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
         unsigned ct = 0;
+        unsigned yields = 0;
         while (VL_UNLIKELY(!ready(evenCycle, predp, nWords))) {
             VL_CPU_RELAX();
             ++ct;
             if (VL_UNLIKELY(ct > VL_LOCK_SPINS)) {
                 ct = 0;
+                if (VL_UNLIKELY(++yields >= SLEEP_AFTER_YIELDS)) {
+                    blockUntilReady(evenCycle, predp, nWords);
+                    return;
+                }
                 VlMTaskVertex::yieldThread();
             }
         }
@@ -155,6 +175,7 @@ public:
 
     VlMTaskDoneMask() {
         for (unsigned i = 0; i < WORDS; ++i) m_word[i].store(0, std::memory_order_relaxed);
+        m_waiters.store(0, std::memory_order_relaxed);
     }
     ~VlMTaskDoneMask() = default;
 
@@ -167,6 +188,15 @@ public:
             m_word[word].fetch_or(mask, std::memory_order_release);
         } else {
             m_word[word].fetch_and(static_cast<uint64_t>(~mask), std::memory_order_release);
+        }
+        // Wake sleepers blocked in blockUntilReady. Holding m_mutex across
+        // notify_all pairs with the waiter's lock so a notification cannot be
+        // lost between the ready() check and the atomic sleep; waiters
+        // re-evaluate ready() under the lock and go back to sleep if their
+        // particular predecessor bits are not all set yet.
+        if (VL_UNLIKELY(m_waiters.load(std::memory_order_acquire) != 0)) {
+            const std::lock_guard<std::mutex> lock{m_mutex};
+            m_cv.notify_all();
         }
     }
 
