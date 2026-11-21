@@ -33,29 +33,6 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__) && !defined(VL_NO_MTASK_FUTEX)
-# include <climits>
-# include <linux/futex.h>
-# include <sys/syscall.h>
-# include <unistd.h>
-# define VL_MTASK_FUTEX 1
-// Wait/wake on a 32-bit futex word. FUTEX_WAIT_PRIVATE atomically
-// re-checks *addr == val before sleeping, so a signal racing the wait
-// can never be lost. FUTEX_WAKE_PRIVATE with INT_MAX wakes all.
-static inline int vlMtaskFutexWait(const std::atomic<uint32_t>* addr, uint32_t val) {
-    return static_cast<int>(::syscall(SYS_futex,
-                                      reinterpret_cast<const uint32_t*>(addr),
-                                      FUTEX_WAIT_PRIVATE, val, nullptr, nullptr, 0));
-}
-static inline int vlMtaskFutexWakeAll(std::atomic<uint32_t>* addr) {
-    return static_cast<int>(::syscall(SYS_futex,
-                                      reinterpret_cast<uint32_t*>(addr),
-                                      FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0));
-}
-#else
-# define VL_MTASK_FUTEX 0
-#endif
-
 // clang-format off
 #if defined(__linux)
 # include <sched.h>  // For sched_getcpu()
@@ -156,48 +133,19 @@ class VlMTaskDoneMask final {
     static constexpr unsigned WORDS = 16;
 
     std::atomic<uint64_t> m_word[WORDS];
-#if VL_MTASK_FUTEX
-    // Bumped once per signal() so blocked waiters can observe progress;
-    // m_waiters lets signal() skip the wake syscall when nobody sleeps.
-    mutable std::atomic<uint32_t> m_epoch{0};
-    mutable std::atomic<uint32_t> m_waiters{0};
-#endif
 
     bool wordReady(unsigned word, bool evenCycle, uint64_t pred) const {
         const uint64_t got = m_word[word].load(std::memory_order_acquire);
         return evenCycle ? ((got & pred) == pred) : ((got & pred) == 0);
     }
-#if VL_MTASK_FUTEX
-    // Stage 3: park on the epoch futex until the barrier advances.
-    // Retired-instruction cost while blocked is ~zero; wake latency is
-    // only paid once a wait has already outlasted the spin+yield budget.
-    void blockUntil(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
-        m_waiters.fetch_add(1, std::memory_order_acq_rel);
-        while (VL_UNLIKELY(!ready(evenCycle, predp, nWords))) {
-            const uint32_t snap = m_epoch.load(std::memory_order_acquire);
-            if (VL_LIKELY(ready(evenCycle, predp, nWords))) break;
-            vlMtaskFutexWait(&m_epoch, snap);
-        }
-        m_waiters.fetch_sub(1, std::memory_order_acq_rel);
-    }
-#endif
     void spinUntil(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
         unsigned ct = 0;
-#if VL_MTASK_FUTEX
-        unsigned yields = 0;
-#endif
         while (VL_UNLIKELY(!ready(evenCycle, predp, nWords))) {
             VL_CPU_RELAX();
             ++ct;
             if (VL_UNLIKELY(ct > VL_LOCK_SPINS)) {
                 ct = 0;
                 VlMTaskVertex::yieldThread();
-#if VL_MTASK_FUTEX
-                if (VL_UNLIKELY(++yields >= 16)) {
-                    blockUntil(evenCycle, predp, nWords);
-                    return;
-                }
-#endif
             }
         }
     }
@@ -220,12 +168,6 @@ public:
         } else {
             m_word[word].fetch_and(static_cast<uint64_t>(~mask), std::memory_order_release);
         }
-#if VL_MTASK_FUTEX
-        m_epoch.fetch_add(1, std::memory_order_release);
-        if (VL_UNLIKELY(m_waiters.load(std::memory_order_acquire))) {
-            vlMtaskFutexWakeAll(&m_epoch);
-        }
-#endif
     }
 
     bool ready(bool evenCycle, const uint64_t* predp, unsigned nWords) const {
