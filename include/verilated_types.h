@@ -40,6 +40,9 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#if defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512VBMI2__)
+#include <immintrin.h>  // vpshrdvd hardware funnel fast path (_VL_HW_FUNNEL)
+#endif
 
 //===================================================================
 // String formatters (required by below containers)
@@ -103,6 +106,15 @@ extern std::string VL_TO_STRING_W(int words, const WDataInP obj);
 #endif
 #endif
 
+// AVX512-VBMI2 hardware funnel: vpshrdvd computes (a >> c) | (b << (32 - c))
+// per dword lane in one instruction where the generic shift/or form needs
+// three. gcc/clang do not fuse the portable vector expression into it, so the
+// funnel kernels below take the intrinsic fast path when it is available.
+#if !defined(VL_DISABLE_SIMD) && !defined(VL_PORTABLE_ONLY) \
+    && defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512VBMI2__)
+#define _VL_HW_FUNNEL 1
+#endif
+
 #ifdef VL_SIMD_WORDS
 typedef EData VlSimdE __attribute__((vector_size(VL_SIMD_WORDS * sizeof(EData))));
 static inline VlSimdE _vl_simd_load(const EData* p) VL_PURE {
@@ -157,6 +169,75 @@ static inline EData _vl_simd_or_lanes_q(VlSimdQuarter v) VL_PURE {
     EData r = 0;
     for (int k = 0; k < VL_SIMD_QUARTER_WORDS; ++k) r |= v[k];
     return r;
+}
+#endif
+// Hardware funnel fast paths: one vpshrdvd per chunk instead of two shifts and
+// an or. Every caller passes shl == VL_EDATASIZE - shr, so the per-lane count
+// reproduces both sides of the funnel from shr alone.
+static inline void _vl_simd_funnel_f(EData* dst, const EData* src, int shr,
+                                     int shl) VL_MT_SAFE {
+#if defined(_VL_HW_FUNNEL) && VL_SIMD_WORDS == 16
+    (void)shl;
+    _mm512_storeu_si512(reinterpret_cast<void*>(dst),
+                        _mm512_shrdv_epi32(_mm512_loadu_si512(src),
+                                           _mm512_loadu_si512(src + 1),
+                                           _mm512_set1_epi32(shr)));
+#elif defined(_VL_HW_FUNNEL) && VL_SIMD_WORDS == 8
+    (void)shl;
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst),
+                        _mm256_shrdv_epi32(_mm256_loadu_si256(
+                                               reinterpret_cast<const __m256i*>(src)),
+                                           _mm256_loadu_si256(
+                                               reinterpret_cast<const __m256i*>(src + 1)),
+                                           _mm256_set1_epi32(shr)));
+#else
+    const VlSimdE cur = _vl_simd_load(src);
+    const VlSimdE nxt = _vl_simd_load(src + 1);
+    _vl_simd_store(dst, (cur >> shr) | (nxt << shl));
+#endif
+}
+#ifdef VL_SIMD_HALF_WORDS
+static inline void _vl_simd_funnel_h(EData* dst, const EData* src, int shr,
+                                     int shl) VL_MT_SAFE {
+#if defined(_VL_HW_FUNNEL) && VL_SIMD_HALF_WORDS == 8
+    (void)shl;
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst),
+                        _mm256_shrdv_epi32(_mm256_loadu_si256(
+                                               reinterpret_cast<const __m256i*>(src)),
+                                           _mm256_loadu_si256(
+                                               reinterpret_cast<const __m256i*>(src + 1)),
+                                           _mm256_set1_epi32(shr)));
+#elif defined(_VL_HW_FUNNEL) && VL_SIMD_HALF_WORDS == 4
+    (void)shl;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst),
+                     _mm_shrdv_epi32(_mm_loadu_si128(
+                                         reinterpret_cast<const __m128i*>(src)),
+                                     _mm_loadu_si128(
+                                         reinterpret_cast<const __m128i*>(src + 1)),
+                                     _mm_set1_epi32(shr)));
+#else
+    const VlSimdHalf cur = _vl_simd_load_h(src);
+    const VlSimdHalf nxt = _vl_simd_load_h(src + 1);
+    _vl_simd_store_h(dst, (cur >> shr) | (nxt << shl));
+#endif
+}
+#endif
+#ifdef VL_SIMD_QUARTER_WORDS
+static inline void _vl_simd_funnel_q(EData* dst, const EData* src, int shr,
+                                     int shl) VL_MT_SAFE {
+#if defined(_VL_HW_FUNNEL) && VL_SIMD_QUARTER_WORDS == 4
+    (void)shl;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst),
+                     _mm_shrdv_epi32(_mm_loadu_si128(
+                                         reinterpret_cast<const __m128i*>(src)),
+                                     _mm_loadu_si128(
+                                         reinterpret_cast<const __m128i*>(src + 1)),
+                                     _mm_set1_epi32(shr)));
+#else
+    const VlSimdQuarter cur = _vl_simd_load_q(src);
+    const VlSimdQuarter nxt = _vl_simd_load_q(src + 1);
+    _vl_simd_store_q(dst, (cur >> shr) | (nxt << shl));
+#endif
 }
 #endif
 #endif
@@ -335,25 +416,16 @@ static inline void _vl_words_funnel(EData* dst, const EData* src, int n, int shr
                                     int shl) VL_MT_SAFE {
     int t = 0;
 #ifdef VL_SIMD_WORDS
-    for (; t + VL_SIMD_WORDS <= n; t += VL_SIMD_WORDS) {
-        const VlSimdE cur = _vl_simd_load(src + t);
-        const VlSimdE nxt = _vl_simd_load(src + t + 1);
-        _vl_simd_store(dst + t, (cur >> shr) | (nxt << shl));
-    }
+    for (; t + VL_SIMD_WORDS <= n; t += VL_SIMD_WORDS)
+        _vl_simd_funnel_f(dst + t, src + t, shr, shl);
 #endif
 #ifdef VL_SIMD_HALF_WORDS
-    for (; t + VL_SIMD_HALF_WORDS <= n; t += VL_SIMD_HALF_WORDS) {
-        const VlSimdHalf cur = _vl_simd_load_h(src + t);
-        const VlSimdHalf nxt = _vl_simd_load_h(src + t + 1);
-        _vl_simd_store_h(dst + t, (cur >> shr) | (nxt << shl));
-    }
+    for (; t + VL_SIMD_HALF_WORDS <= n; t += VL_SIMD_HALF_WORDS)
+        _vl_simd_funnel_h(dst + t, src + t, shr, shl);
 #endif
 #ifdef VL_SIMD_QUARTER_WORDS
-    for (; t + VL_SIMD_QUARTER_WORDS <= n; t += VL_SIMD_QUARTER_WORDS) {
-        const VlSimdQuarter cur = _vl_simd_load_q(src + t);
-        const VlSimdQuarter nxt = _vl_simd_load_q(src + t + 1);
-        _vl_simd_store_q(dst + t, (cur >> shr) | (nxt << shl));
-    }
+    for (; t + VL_SIMD_QUARTER_WORDS <= n; t += VL_SIMD_QUARTER_WORDS)
+        _vl_simd_funnel_q(dst + t, src + t, shr, shl);
 #endif
     for (; t < n; ++t) dst[t] = (src[t] >> shr) | (src[t + 1] << shl);
 }
