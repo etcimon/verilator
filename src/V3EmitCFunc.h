@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -272,8 +273,10 @@ public:
         }
 
         if (nodep->initsp()) {
+            scanCoveredInit(nodep);
             putsDecoration("// Init\n");
             iterateAndNextNull(nodep->initsp());
+            m_coverInit.clear();
         }
 
         if (nodep->stmtsp()) {
@@ -288,6 +291,121 @@ public:
 
         puts("}\n");
         if (nodep->ifdef() != "") puts("#endif  // " + nodep->ifdef() + "\n");
+    }
+
+    // Func-local wide vars whose first touches unconditionally cover every
+    // word get a dead prologue memset; scanCoveredInit marks them so the
+    // AstCReset in initsp emits nothing. Conservative: any touch the walk
+    // cannot prove covering keeps the zero-init.
+    std::unordered_set<const AstVar*> m_coverInit;
+
+    static bool initExprUsesVar(const AstNode* np, const AstVar* varp) {
+        if (!np) return false;
+        if (const AstNodeVarRef* const vrp = VN_CAST(np, NodeVarRef)) {
+            if (vrp->varp() == varp) return true;
+        }
+        return initExprUsesVar(np->op1p(), varp) || initExprUsesVar(np->op2p(), varp)
+               || initExprUsesVar(np->op3p(), varp) || initExprUsesVar(np->op4p(), varp);
+    }
+
+    // Credit coverage for an assign LHS. Returns false when the LHS touches
+    // varp in a form that cannot be proven covering (caller disqualifies).
+    static bool initCoverLhs(const AstNode* lhsp, const AstVar* varp,
+                             std::vector<bool>& covered) {
+        if (const AstVarRef* const vrp = VN_CAST(lhsp, VarRef)) {
+            if (vrp->varp() == varp) {
+                std::fill(covered.begin(), covered.end(), true);
+            }
+            return true;
+        }
+        if (const AstSel* const selp = VN_CAST(lhsp, Sel)) {
+            if (const AstVarRef* const vrp = VN_CAST(selp->fromp(), VarRef)) {
+                if (vrp->varp() == varp && VN_IS(selp->lsbp(), Const)
+                    && VN_IS(selp->widthp(), Const)) {
+                    const int hi = selp->msbConst();
+                    for (int b = selp->lsbConst();
+                         b <= hi && b < static_cast<int>(covered.size()); ++b) {
+                        covered[b] = true;
+                    }
+                    return true;
+                }
+            }
+            return !initExprUsesVar(lhsp, varp);
+        }
+        if (const AstWordSel* const wsp = VN_CAST(lhsp, WordSel)) {
+            if (const AstVarRef* const vrp = VN_CAST(wsp->fromp(), VarRef)) {
+                if (vrp->varp() == varp && VN_IS(wsp->bitp(), Const)) {
+                    const int lo = VN_AS(wsp->bitp(), Const)->toSInt() * 32;
+                    for (int b = lo; b < lo + 32 && b < static_cast<int>(covered.size()); ++b) {
+                        covered[b] = true;
+                    }
+                    return true;
+                }
+            }
+            return !initExprUsesVar(lhsp, varp);
+        }
+        if (const AstConcat* const conp = VN_CAST(lhsp, Concat)) {
+            return initCoverLhs(conp->lhsp(), varp, covered)
+                   && initCoverLhs(conp->rhsp(), varp, covered);
+        }
+        return !initExprUsesVar(lhsp, varp);
+    }
+
+    static void collectCResetCandidates(const AstNode* np,
+                                        std::unordered_map<const AstVar*,
+                                                           std::vector<bool>>& cover) {
+        if (!np) return;
+        if (const AstCReset* const crstp = VN_CAST(np, CReset)) {
+            const AstVar* const varp = crstp->varrefp()->varp();
+            if (varp->isFuncLocal() && !varp->valuep() && varp->basicp() && varp->isWide()) {
+                cover[varp].assign(varp->widthMin(), false);
+            }
+            return;
+        }
+        collectCResetCandidates(np->op1p(), cover);
+        collectCResetCandidates(np->op2p(), cover);
+        collectCResetCandidates(np->op3p(), cover);
+        collectCResetCandidates(np->op4p(), cover);
+        collectCResetCandidates(np->nextp(), cover);
+    }
+
+    void scanCoveredInit(const AstCFunc* funcp) {
+        // Candidates: func-local wide vars whose initsp reset is a plain
+        // zero with no explicit initializer.
+        std::unordered_map<const AstVar*, std::vector<bool>> cover;
+        for (const AstNode* ip = funcp->initsp(); ip; ip = ip->nextp()) {
+            collectCResetCandidates(ip, cover);
+        }
+        if (cover.empty()) return;
+        for (const AstNode* sp = funcp->stmtsp(); sp && !cover.empty(); sp = sp->nextp()) {
+            const AstNodeAssign* const asn = VN_CAST(sp, NodeAssign);
+            for (auto it = cover.begin(); it != cover.end();) {
+                const AstVar* const varp = it->first;
+                bool disq = false;
+                if (asn) {
+                    // A read anywhere on the RHS before full coverage, or an
+                    // LHS touching the var in an unprovable form, kills it.
+                    if (initExprUsesVar(asn->rhsp(), varp)) {
+                        disq = true;
+                    } else if (!initCoverLhs(asn->lhsp(), varp, it->second)) {
+                        disq = true;
+                    }
+                } else if (initExprUsesVar(sp, varp)) {
+                    // Conditional writes never credit coverage; reads or any
+                    // other touch disqualify conservatively.
+                    disq = true;
+                }
+                if (!disq) {
+                    bool full = true;
+                    for (const bool b : it->second) full &= b;
+                    if (full) {
+                        m_coverInit.insert(varp);
+                        disq = true;  // Done with this var either way
+                    }
+                }
+                it = disq ? cover.erase(it) : std::next(it);
+            }
+        }
     }
 
     void visit(AstVar* nodep) override {
@@ -1300,7 +1418,9 @@ public:
     }
     void visit(AstCReset* nodep) override {
         AstVar* const varp = nodep->varrefp()->varp();
-        emitVarReset(varp);
+        // Skip the prologue memset when scanCoveredInit proved this func-local
+        // is unconditionally covered by its first writes.
+        if (!m_coverInit.count(varp)) emitVarReset(varp);
     }
     void visit(AstExecGraph* nodep) override {
         // The location of the AstExecGraph within the containing AstCFunc is where we want to
