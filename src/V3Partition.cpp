@@ -2767,8 +2767,32 @@ void V3Partition::go(V3Graph* mtasksp) {
     // remove this later if it doesn't really help.
     mtasksp->orderPreRanked();
 
-    const int targetParFactor = v3Global.opt.threads();
+    int targetParFactor = v3Global.opt.threads();
     if (targetParFactor < 2) v3fatalSrc("We should not reach V3Partition when --threads <= 1");
+
+    // If the user asked for more parallelism than the graph actually has,
+    // coarsening toward that count over-fragments the MTask graph: each task
+    // boundary adds a VlMTaskDoneMask dependency-mask + spin/dispatch cost per
+    // evaluation, and the surplus workers mostly spin-wait. Measure the
+    // pre-coarsening parallelism (critical paths were just initialized above)
+    // and don't target more parallelism than the graph can supply. This keeps
+    // an over-large --threads from needlessly increasing the sync surface.
+    {
+        PartParallelismEst parEst{mtasksp};
+        parEst.traverse();
+        const double measuredPar = parEst.parallelismFactor();
+        UINFO(4, "V3Partition measured parallelism factor = " << measuredPar
+                                                              << " (threads=" << targetParFactor
+                                                              << ")" << endl);
+        // Round up: a factor of e.g. 2.3 can still feed ~3-way parallelism.
+        const int graphPar = static_cast<int>(ceil(measuredPar));
+        if (graphPar >= 2 && graphPar < targetParFactor) {
+            UINFO(4, "V3Partition capping coarsening target " << targetParFactor
+                                                              << " -> " << graphPar
+                                                              << " (graph parallelism)" << endl);
+            targetParFactor = graphPar;
+        }
+    }
 
     // Set cpLimit to roughly totalGraphCost / nThreads
     //
