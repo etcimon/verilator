@@ -137,6 +137,28 @@ static inline EData _vl_simd_or_lanes_h(VlSimdHalf v) VL_PURE {
     return r;
 }
 #endif
+// Quarter-width tier: only useful when the full vector is wide enough that the
+// half tier still can't reach the most common 4-7 word operands. With AVX-512
+// (VL_SIMD_WORDS==16 -> half==8) a 4-word (128-bit) quarter pass keeps those
+// operands on a vector op instead of a scalar tail; for AVX2 (half==4) and
+// SSE2/NEON (full==4) the half/full tiers already cover it, so it is skipped.
+#if VL_SIMD_WORDS >= 16
+#define VL_SIMD_QUARTER_WORDS (VL_SIMD_WORDS / 4)
+typedef EData VlSimdQuarter __attribute__((vector_size(VL_SIMD_QUARTER_WORDS * sizeof(EData))));
+static inline VlSimdQuarter _vl_simd_load_q(const EData* p) VL_PURE {
+    VlSimdQuarter v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline void _vl_simd_store_q(EData* p, VlSimdQuarter v) VL_MT_SAFE {
+    std::memcpy(p, &v, sizeof(v));
+}
+static inline EData _vl_simd_or_lanes_q(VlSimdQuarter v) VL_PURE {
+    EData r = 0;
+    for (int k = 0; k < VL_SIMD_QUARTER_WORDS; ++k) r |= v[k];
+    return r;
+}
+#endif
 #endif
 
 // True when [ap, ap+awords) and [bp, bp+bwords) share no word.
@@ -175,6 +197,7 @@ static inline void _vl_words_fill(EData* owp, EData value, int words) VL_MT_SAFE
         int i = 0; \
         VL_SIMD_FULL_PASS_(expr_v) \
         VL_SIMD_HALF_PASS_(expr_v) \
+        VL_SIMD_QUARTER_PASS_(expr_v) \
         for (; i < words; ++i) owp[i] = (expr_s); \
     }
 #ifdef VL_SIMD_WORDS
@@ -199,11 +222,23 @@ static inline void _vl_words_fill(EData* owp, EData value, int words) VL_MT_SAFE
 #else
 #define VL_SIMD_HALF_PASS_(expr_v)
 #endif
+#ifdef VL_SIMD_QUARTER_WORDS
+#define VL_SIMD_QUARTER_PASS_(expr_v) \
+    for (; i + VL_SIMD_QUARTER_WORDS <= words; i += VL_SIMD_QUARTER_WORDS) { \
+        const VlSimdQuarter l = _vl_simd_load_q(lwp + i); \
+        const VlSimdQuarter r = _vl_simd_load_q(rwp + i); \
+        (void)r; \
+        _vl_simd_store_q(owp + i, (expr_v)); \
+    }
+#else
+#define VL_SIMD_QUARTER_PASS_(expr_v)
+#endif
 VL_SIMD_ELEMENTWISE_(_vl_words_and, l & r, lwp[i] & rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_or, l | r, lwp[i] | rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_xor, l ^ r, lwp[i] ^ rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_not, ~l, ~lwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_andnot, l & ~r, lwp[i] & ~rwp[i])
+#undef VL_SIMD_QUARTER_PASS_
 #undef VL_SIMD_HALF_PASS_
 #undef VL_SIMD_FULL_PASS_
 #undef VL_SIMD_ELEMENTWISE_
@@ -227,6 +262,12 @@ static inline EData _vl_words_orxor(const EData* lwp, const EData* rwp, int word
         i += VL_SIMD_HALF_WORDS;
     }
 #endif
+#ifdef VL_SIMD_QUARTER_WORDS
+    if (i + VL_SIMD_QUARTER_WORDS <= words) {
+        acc |= _vl_simd_or_lanes_q(_vl_simd_load_q(lwp + i) ^ _vl_simd_load_q(rwp + i));
+        i += VL_SIMD_QUARTER_WORDS;
+    }
+#endif
     for (; i < words; ++i) acc |= lwp[i] ^ rwp[i];
     return acc;
 }
@@ -246,6 +287,12 @@ static inline EData _vl_words_orall(const EData* lwp, int words) VL_PURE {
     if (i + VL_SIMD_HALF_WORDS <= words) {
         acc |= _vl_simd_or_lanes_h(_vl_simd_load_h(lwp + i));
         i += VL_SIMD_HALF_WORDS;
+    }
+#endif
+#ifdef VL_SIMD_QUARTER_WORDS
+    if (i + VL_SIMD_QUARTER_WORDS <= words) {
+        acc |= _vl_simd_or_lanes_q(_vl_simd_load_q(lwp + i));
+        i += VL_SIMD_QUARTER_WORDS;
     }
 #endif
     for (; i < words; ++i) acc |= lwp[i];
@@ -271,6 +318,13 @@ static inline EData _vl_words_xorall(const EData* lwp, int words) VL_PURE {
         i += VL_SIMD_HALF_WORDS;
     }
 #endif
+#ifdef VL_SIMD_QUARTER_WORDS
+    if (i + VL_SIMD_QUARTER_WORDS <= words) {
+        const VlSimdQuarter vq = _vl_simd_load_q(lwp + i);
+        for (int k = 0; k < VL_SIMD_QUARTER_WORDS; ++k) acc ^= vq[k];
+        i += VL_SIMD_QUARTER_WORDS;
+    }
+#endif
     for (; i < words; ++i) acc ^= lwp[i];
     return acc;
 }
@@ -292,6 +346,13 @@ static inline void _vl_words_funnel(EData* dst, const EData* src, int n, int shr
         const VlSimdHalf cur = _vl_simd_load_h(src + t);
         const VlSimdHalf nxt = _vl_simd_load_h(src + t + 1);
         _vl_simd_store_h(dst + t, (cur >> shr) | (nxt << shl));
+    }
+#endif
+#ifdef VL_SIMD_QUARTER_WORDS
+    for (; t + VL_SIMD_QUARTER_WORDS <= n; t += VL_SIMD_QUARTER_WORDS) {
+        const VlSimdQuarter cur = _vl_simd_load_q(src + t);
+        const VlSimdQuarter nxt = _vl_simd_load_q(src + t + 1);
+        _vl_simd_store_q(dst + t, (cur >> shr) | (nxt << shl));
     }
 #endif
     for (; t < n; ++t) dst[t] = (src[t] >> shr) | (src[t + 1] << shl);
