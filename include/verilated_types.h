@@ -116,6 +116,27 @@ static inline EData _vl_simd_or_lanes(VlSimdE v) VL_PURE {
     for (int k = 0; k < VL_SIMD_WORDS; ++k) r |= v[k];
     return r;
 }
+// Half-width tier: a chunk of VL_SIMD_WORDS/2 words (128-bit for AVX2) lets
+// word counts in [VL_SIMD_WORDS/2, VL_SIMD_WORDS) use a vector op instead of
+// falling through to the scalar tail. The most common wide operands are
+// 128-224 bits (4-7 words), which the full-width chunk alone cannot reach.
+#if VL_SIMD_WORDS >= 4
+#define VL_SIMD_HALF_WORDS (VL_SIMD_WORDS / 2)
+typedef EData VlSimdHalf __attribute__((vector_size(VL_SIMD_HALF_WORDS * sizeof(EData))));
+static inline VlSimdHalf _vl_simd_load_h(const EData* p) VL_PURE {
+    VlSimdHalf v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline void _vl_simd_store_h(EData* p, VlSimdHalf v) VL_MT_SAFE {
+    std::memcpy(p, &v, sizeof(v));
+}
+static inline EData _vl_simd_or_lanes_h(VlSimdHalf v) VL_PURE {
+    EData r = 0;
+    for (int k = 0; k < VL_SIMD_HALF_WORDS; ++k) r |= v[k];
+    return r;
+}
+#endif
 #endif
 
 // True when [ap, ap+awords) and [bp, bp+bwords) share no word.
@@ -145,15 +166,19 @@ static inline void _vl_words_fill(EData* owp, EData value, int words) VL_MT_SAFE
 }
 
 // Elementwise kernels. Op is applied lane by lane.
+// Each kernel emits a full-width SIMD pass, then a half-width pass (when the
+// target has one), then a scalar tail, so every word count >= half-width uses
+// a vector op rather than dropping to scalar for the whole operand.
 #define VL_SIMD_ELEMENTWISE_(name, expr_v, expr_s) \
     static inline void name(EData* owp, const EData* lwp, const EData* rwp, int words) \
         VL_MT_SAFE { \
         int i = 0; \
-        VL_SIMD_CHUNKS_(expr_v) \
+        VL_SIMD_FULL_PASS_(expr_v) \
+        VL_SIMD_HALF_PASS_(expr_v) \
         for (; i < words; ++i) owp[i] = (expr_s); \
     }
 #ifdef VL_SIMD_WORDS
-#define VL_SIMD_CHUNKS_(expr_v) \
+#define VL_SIMD_FULL_PASS_(expr_v) \
     for (; i + VL_SIMD_WORDS <= words; i += VL_SIMD_WORDS) { \
         const VlSimdE l = _vl_simd_load(lwp + i); \
         const VlSimdE r = _vl_simd_load(rwp + i); \
@@ -161,14 +186,26 @@ static inline void _vl_words_fill(EData* owp, EData value, int words) VL_MT_SAFE
         _vl_simd_store(owp + i, (expr_v)); \
     }
 #else
-#define VL_SIMD_CHUNKS_(expr_v)
+#define VL_SIMD_FULL_PASS_(expr_v)
+#endif
+#ifdef VL_SIMD_HALF_WORDS
+#define VL_SIMD_HALF_PASS_(expr_v) \
+    for (; i + VL_SIMD_HALF_WORDS <= words; i += VL_SIMD_HALF_WORDS) { \
+        const VlSimdHalf l = _vl_simd_load_h(lwp + i); \
+        const VlSimdHalf r = _vl_simd_load_h(rwp + i); \
+        (void)r; \
+        _vl_simd_store_h(owp + i, (expr_v)); \
+    }
+#else
+#define VL_SIMD_HALF_PASS_(expr_v)
 #endif
 VL_SIMD_ELEMENTWISE_(_vl_words_and, l & r, lwp[i] & rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_or, l | r, lwp[i] | rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_xor, l ^ r, lwp[i] ^ rwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_not, ~l, ~lwp[i])
 VL_SIMD_ELEMENTWISE_(_vl_words_andnot, l & ~r, lwp[i] & ~rwp[i])
-#undef VL_SIMD_CHUNKS_
+#undef VL_SIMD_HALF_PASS_
+#undef VL_SIMD_FULL_PASS_
 #undef VL_SIMD_ELEMENTWISE_
 
 // OR over all words of (lwp[i] ^ rwp[i]); zero iff equal.
@@ -184,6 +221,12 @@ static inline EData _vl_words_orxor(const EData* lwp, const EData* rwp, int word
         acc = _vl_simd_or_lanes(vacc);
     }
 #endif
+#ifdef VL_SIMD_HALF_WORDS
+    if (i + VL_SIMD_HALF_WORDS <= words) {
+        acc |= _vl_simd_or_lanes_h(_vl_simd_load_h(lwp + i) ^ _vl_simd_load_h(rwp + i));
+        i += VL_SIMD_HALF_WORDS;
+    }
+#endif
     for (; i < words; ++i) acc |= lwp[i] ^ rwp[i];
     return acc;
 }
@@ -197,6 +240,12 @@ static inline EData _vl_words_orall(const EData* lwp, int words) VL_PURE {
             vacc |= _vl_simd_load(lwp + i);
         }
         acc = _vl_simd_or_lanes(vacc);
+    }
+#endif
+#ifdef VL_SIMD_HALF_WORDS
+    if (i + VL_SIMD_HALF_WORDS <= words) {
+        acc |= _vl_simd_or_lanes_h(_vl_simd_load_h(lwp + i));
+        i += VL_SIMD_HALF_WORDS;
     }
 #endif
     for (; i < words; ++i) acc |= lwp[i];
@@ -215,6 +264,13 @@ static inline EData _vl_words_xorall(const EData* lwp, int words) VL_PURE {
         for (int k = 0; k < VL_SIMD_WORDS; ++k) acc ^= vacc[k];
     }
 #endif
+#ifdef VL_SIMD_HALF_WORDS
+    if (i + VL_SIMD_HALF_WORDS <= words) {
+        const VlSimdHalf vh = _vl_simd_load_h(lwp + i);
+        for (int k = 0; k < VL_SIMD_HALF_WORDS; ++k) acc ^= vh[k];
+        i += VL_SIMD_HALF_WORDS;
+    }
+#endif
     for (; i < words; ++i) acc ^= lwp[i];
     return acc;
 }
@@ -229,6 +285,13 @@ static inline void _vl_words_funnel(EData* dst, const EData* src, int n, int shr
         const VlSimdE cur = _vl_simd_load(src + t);
         const VlSimdE nxt = _vl_simd_load(src + t + 1);
         _vl_simd_store(dst + t, (cur >> shr) | (nxt << shl));
+    }
+#endif
+#ifdef VL_SIMD_HALF_WORDS
+    for (; t + VL_SIMD_HALF_WORDS <= n; t += VL_SIMD_HALF_WORDS) {
+        const VlSimdHalf cur = _vl_simd_load_h(src + t);
+        const VlSimdHalf nxt = _vl_simd_load_h(src + t + 1);
+        _vl_simd_store_h(dst + t, (cur >> shr) | (nxt << shl));
     }
 #endif
     for (; t < n; ++t) dst[t] = (src[t] >> shr) | (src[t + 1] << shl);
