@@ -3049,6 +3049,42 @@ static void setMaskBit(std::vector<uint64_t>& words, uint32_t bit) {
     words.at(bit >> 6) |= (static_cast<uint64_t>(1) << (bit & 63));
 }
 
+// Compiler-side evidence only. Keep graph predecessors distinct from the
+// retained waits: a lane-order guarantee is not permission to reorder a task.
+static void dumpSentinel(const ThreadSchedule& schedule, const string& tag,
+                         const std::vector<std::vector<uint64_t>>& preds) {
+    const string filename = v3Global.debugFilename("sentinel_" + tag) + ".json";
+    const std::unique_ptr<std::ofstream> osp{V3File::new_ofstream(filename)};
+    if (osp->fail()) v3fatal("Can't write " << filename);
+    *osp << "{\"schema\":\"v3-sentinel-1\",\"region\":\"" << tag << "\",\"tasks\":[";
+    bool first = true;
+    for (const auto& lane : schedule.threads) {
+        for (const ExecMTask* const taskp : lane) {
+            *osp << (first ? "\n" : ",\n") << "{\"id\":" << taskp->id()
+                 << ",\"lane\":" << schedule.threadId(taskp) << ",\"cost\":" << taskp->cost()
+                 << ",\"profile_key\":\"" << taskp->hashName() << "\",\"deps\":[";
+            first = false;
+            std::set<uint32_t> ids;
+            for (V3GraphEdge* ep = taskp->inBeginp(); ep; ep = ep->inNextp()) {
+                ids.insert(static_cast<const ExecMTask*>(ep->fromp())->id());
+            }
+            const auto& mask = preds[taskp->id()];
+            for (const uint32_t id : ids) *osp << (id == *ids.begin() ? "" : ",") << id;
+            *osp << "],\"waits\":[";
+            bool firstWait = true;
+            for (const uint32_t id : ids) {
+                if (id / 64 >= mask.size() || !((mask[id / 64] >> (id % 64)) & 1)) continue;
+                *osp << (firstWait ? "" : ",") << id;
+                firstWait = false;
+            }
+            *osp << "]}";
+        }
+    }
+    *osp << "\n]}\n";
+    osp->close();
+    if (osp->fail()) v3fatal("Can't finish writing " << filename);
+}
+
 static string hexU64(uint64_t value) {
     std::ostringstream os;
     os << "0x" << std::hex << value << "ULL";
@@ -3082,19 +3118,8 @@ static string emitWaitStmt(const string& doneName, const string& evenExpr,
     return stmt;
 }
 
-static std::vector<uint64_t> crossThreadPredMask(const ThreadSchedule& schedule,
-                                                 const ExecMTask* mtaskp, uint32_t nWords) {
-    std::vector<uint64_t> pred(nWords, 0);
-    const uint32_t thisThreadId = schedule.threadId(mtaskp);
-    for (V3GraphEdge* edgep = mtaskp->inBeginp(); edgep; edgep = edgep->inNextp()) {
-        const ExecMTask* const prevp = dynamic_cast<ExecMTask*>(edgep->fromp());
-        if (schedule.threadId(prevp) != thisThreadId) setMaskBit(pred, prevp->id());
-    }
-    return pred;
-}
-
-static void addMTaskToFunction(const ThreadSchedule& schedule, AstCFunc* funcp,
-                               const ExecMTask* mtaskp, const string& doneName, uint32_t nWords) {
+static void addMTaskToFunction(AstCFunc* funcp, const ExecMTask* mtaskp, const string& doneName,
+                               const std::vector<uint64_t>& pred, bool publish) {
     AstNodeModule* const modp = v3Global.rootp()->topModulep();
     FileLine* const fl = modp->fileline();
 
@@ -3105,9 +3130,7 @@ static void addMTaskToFunction(const ThreadSchedule& schedule, AstCFunc* funcp,
 
     // Same-thread predecessors already ran earlier in this function. The mask
     // lists only the other threads, so the wait is one load of the done word.
-    const string wait = emitWaitStmt(doneName, "even_cycle",
-                                    crossThreadPredMask(schedule, mtaskp, nWords),
-                                    "mt" + cvtToStr(mtaskp->id()));
+    const string wait = emitWaitStmt(doneName, "even_cycle", pred, "mt" + cvtToStr(mtaskp->id()));
     if (!wait.empty()) addStrStmt(wait);
 
     if (v3Global.opt.profExec()) {
@@ -3145,7 +3168,9 @@ static void addMTaskToFunction(const ThreadSchedule& schedule, AstCFunc* funcp,
 
     // Publish this task's bit. Cross-thread successors observe it through
     // their predecessor mask; same-thread successors do not look at it.
-    addStrStmt("vlSelf->" + doneName + ".signal(" + cvtToStr(mtaskp->id()) + ", even_cycle);\n");
+    if (publish) {
+        addStrStmt("vlSelf->" + doneName + ".signal(" + cvtToStr(mtaskp->id()) + ", even_cycle);\n");
+    }
 }
 
 struct ThreadFuncs final {
@@ -3187,6 +3212,39 @@ static ThreadFuncs createThreadFunctions(const ThreadSchedule& schedule, const s
     ThreadFuncs result;
     std::vector<uint64_t> threadPred(nWords, 0);
 
+    // An acquire of producer step k also covers steps 1..k-1 on that lane.
+    // Within a consumer lane an earlier acquire remains valid for the rest of this invocation.
+    std::vector<uint32_t> step(maxMTaskId + 1);
+    for (const auto& thread : schedule.threads) {
+        uint32_t pos = 0;
+        for (const ExecMTask* const taskp : thread) step[taskp->id()] = ++pos;
+    }
+    std::vector<std::vector<uint64_t>> preds(maxMTaskId + 1);
+    std::vector<bool> publish(maxMTaskId + 1);
+    for (const auto& thread : schedule.threads) {
+        std::vector<uint32_t> acquired(maxThreadId + 1);
+        for (const ExecMTask* const taskp : thread) {
+            std::unordered_map<uint32_t, uint32_t> latest;
+            for (V3GraphEdge* edgep = taskp->inBeginp(); edgep; edgep = edgep->inNextp()) {
+                const auto* const prevp = dynamic_cast<const ExecMTask*>(edgep->fromp());
+                const uint32_t lane = schedule.threadId(prevp);
+                const uint32_t id = prevp->id();
+                if (lane == schedule.threadId(taskp) || step[id] <= acquired[lane]) continue;
+                acquired[lane] = step[id];
+                latest[lane] = id;
+            }
+            if (latest.empty()) continue;
+            auto& mask = preds[taskp->id()];
+            mask.resize(nWords);
+            for (const auto& entry : latest) {
+                setMaskBit(mask, entry.second);
+                publish[entry.second] = true;
+            }
+        }
+    }
+
+    if (v3Global.opt.dumpLevel("sentinel")) dumpSentinel(schedule, tag, preds);
+
     // For each thread, create a function representing its entry point
     for (const std::vector<const ExecMTask*>& thread : schedule.threads) {
         if (thread.empty()) continue;
@@ -3206,7 +3264,7 @@ static ThreadFuncs createThreadFunctions(const ThreadSchedule& schedule, const s
 
         // Invoke each mtask scheduled to this thread from the thread function
         for (const ExecMTask* const mtaskp : thread) {
-            addMTaskToFunction(schedule, funcp, mtaskp, doneName, nWords);
+            addMTaskToFunction(funcp, mtaskp, doneName, preds[mtaskp->id()], publish[mtaskp->id()]);
         }
 
         // This thread has finished its tasks. The eval joins on these bits.

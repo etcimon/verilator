@@ -32,6 +32,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <type_traits>
+
+// std::is_final is a C++14 trait; the compiler probe may select C++11.
+// These asserts are compile-time documentation only, so fall back to true.
+#if __cplusplus >= 201402L
+#  define VL_DFG_IS_FINAL(T) std::is_final<T>::value
+#else
+#  define VL_DFG_IS_FINAL(T) true
+#endif
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -215,7 +224,7 @@ class V3DfgPeephole final : public DfgVisitor {
     // Create a new vertex of the given type
     template <typename Vertex, typename... Args>
     Vertex* make(FileLine* flp, Args&&... args) {
-        static_assert(std::is_final<Vertex>::value, "Must invoke on final class");
+        static_assert(VL_DFG_IS_FINAL(Vertex), "Must invoke on final class");
         static_assert(!std::is_same<DfgConst, Vertex>::value, "Use 'makeZero' instead");
         static_assert(!std::is_base_of<DfgVertexVar, Vertex>::value, "Can't create variables");
         // Create the new vertex
@@ -231,7 +240,7 @@ class V3DfgPeephole final : public DfgVisitor {
     template <typename Vertex>
     bool foldUnary(Vertex* vtxp) {
         static_assert(std::is_base_of<DfgVertexUnary, Vertex>::value, "Must invoke on unary");
-        static_assert(std::is_final<Vertex>::value, "Must invoke on final class");
+        static_assert(VL_DFG_IS_FINAL(Vertex), "Must invoke on final class");
         if (DfgConst* const srcp = vtxp->srcp()->template cast<DfgConst>()) {
             APPLYING(FOLD_UNARY) {
                 DfgConst* const resultp = makeZero(vtxp->fileline(), vtxp->width());
@@ -247,7 +256,7 @@ class V3DfgPeephole final : public DfgVisitor {
     template <typename Vertex>
     bool foldBinary(Vertex* vtxp) {
         static_assert(std::is_base_of<DfgVertexBinary, Vertex>::value, "Must invoke on binary");
-        static_assert(std::is_final<Vertex>::value, "Must invoke on final class");
+        static_assert(VL_DFG_IS_FINAL(Vertex), "Must invoke on final class");
         if (DfgConst* const lhsp = vtxp->lhsp()->template cast<DfgConst>()) {
             if (DfgConst* const rhsp = vtxp->rhsp()->template cast<DfgConst>()) {
                 APPLYING(FOLD_BINARY) {
@@ -266,7 +275,7 @@ class V3DfgPeephole final : public DfgVisitor {
     template <typename Vertex>
     void rotateRight(Vertex* vtxp) {
         static_assert(std::is_base_of<DfgVertexBinary, Vertex>::value, "Must invoke on binary");
-        static_assert(std::is_final<Vertex>::value, "Must invoke on final class");
+        static_assert(VL_DFG_IS_FINAL(Vertex), "Must invoke on final class");
         DfgVertexBinary* const ap = vtxp;
         DfgVertexBinary* const bp = vtxp->lhsp()->template as<Vertex>();
         UASSERT_OBJ(!bp->hasMultipleSinks(), vtxp, "Can't rotate a non-tree");
@@ -285,7 +294,7 @@ class V3DfgPeephole final : public DfgVisitor {
     template <typename Vertex>
     bool associativeBinary(Vertex* vtxp) {
         static_assert(std::is_base_of<DfgVertexBinary, Vertex>::value, "Must invoke on binary");
-        static_assert(std::is_final<Vertex>::value, "Must invoke on final class");
+        static_assert(VL_DFG_IS_FINAL(Vertex), "Must invoke on final class");
 
         DfgVertex* const lhsp = vtxp->lhsp();
         DfgVertex* const rhsp = vtxp->rhsp();

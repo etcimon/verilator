@@ -36,9 +36,13 @@
 
 #include "V3Ast.h"
 #include "V3Global.h"
+#include "V3PartitionGraph.h"
 #include "V3Stats.h"
 
 #include <algorithm>
+#include <map>
+#include <queue>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -597,4 +601,621 @@ void V3ClkSkip::clkSkipAll(AstNetlist* netlistp) {
 
     V3Stats::addStat("Optimizations, Clock skip scopes", counted.size());
     V3Global::dumpCheckGlobalTree("clkskip", 0, dumpTree() >= 3);
+}
+
+namespace {
+
+bool impureForSink(const AstNode* nodep) {
+    if (!nodep->isPure() || nodep->isTimingControl()) return true;
+    if (VN_IS(nodep, NodeStmt) && !VN_IS(nodep, Assign) && !VN_IS(nodep, AssignW)
+        && !VN_IS(nodep, If) && !VN_IS(nodep, Comment) && !VN_IS(nodep, CReset)
+        && !VN_IS(nodep, JumpBlock) && !VN_IS(nodep, JumpLabel) && !VN_IS(nodep, JumpGo)) {
+        return true;
+    }
+    return VN_IS(nodep, CExpr) || VN_IS(nodep, CCall) || VN_IS(nodep, CMethodHard)
+           || VN_IS(nodep, CMethodCall) || VN_IS(nodep, CNew) || VN_IS(nodep, UCFunc)
+           || VN_IS(nodep, FuncRef) || VN_IS(nodep, TaskRef) || VN_IS(nodep, VarXRef)
+           || VN_IS(nodep, Display) || VN_IS(nodep, Finish) || VN_IS(nodep, Stop)
+           || VN_IS(nodep, MonitorOff) || VN_IS(nodep, FOpen) || VN_IS(nodep, FClose)
+           || VN_IS(nodep, ReadMem) || VN_IS(nodep, WriteMem) || VN_IS(nodep, Rand)
+           || VN_IS(nodep, CStmt) || VN_IS(nodep, AssignDly) || VN_IS(nodep, SysFuncAsTask)
+           || VN_IS(nodep, Time) || VN_IS(nodep, Assert) || VN_IS(nodep, CoverInc)
+           || VN_IS(nodep, CoverToggle) || VN_IS(nodep, FireEvent) || VN_IS(nodep, Sampled);
+}
+
+bool parseTriggerCond(AstNodeExpr* condp, AstVarScope*& trigVscp, std::set<uint32_t>& bits) {
+    if (AstOr* const orp = VN_CAST(condp, Or)) {
+        return parseTriggerCond(orp->lhsp(), trigVscp, bits)
+               && parseTriggerCond(orp->rhsp(), trigVscp, bits);
+    }
+    AstCMethodHard* const callp = VN_CAST(condp, CMethodHard);
+    if (!callp) return false;
+    AstVarRef* const refp = VN_CAST(callp->fromp(), VarRef);
+    if (!refp || !refp->varScopep()) return false;
+    const AstBasicDType* const basicp = refp->varScopep()->dtypep()->basicp();
+    if (!basicp || !basicp->isTriggerVec()) return false;
+    if (!trigVscp) {
+        trigVscp = refp->varScopep();
+    } else if (trigVscp != refp->varScopep()) {
+        return false;
+    }
+    if (callp->name() == "at") {
+        AstConst* const idxp = VN_CAST(callp->pinsp(), Const);
+        if (!idxp || idxp->nextp() || idxp->num().isFourState()) return false;
+        bits.insert(idxp->toUInt());
+        return true;
+    }
+    if (callp->name() == "wordAny") {
+        AstConst* const wordp = VN_CAST(callp->pinsp(), Const);
+        AstConst* const maskp = wordp ? VN_CAST(wordp->nextp(), Const) : nullptr;
+        if (!wordp || !maskp || maskp->nextp() || wordp->num().isFourState()
+            || maskp->num().isFourState()) {
+            return false;
+        }
+        const uint32_t base = wordp->toUInt() * 64U;
+        uint64_t mask = maskp->toUQuad();
+        if (!mask) return false;
+        while (mask) {
+            const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(mask));
+            bits.insert(base + bit);
+            mask &= (mask - 1ULL);
+        }
+        return true;
+    }
+    return false;
+}
+
+AstNodeExpr* buildTriggerCond(FileLine* flp, AstVarScope* trigVscp,
+                              const std::set<uint32_t>& bits) {
+    std::map<uint32_t, uint64_t> words;
+    for (const uint32_t idx : bits) words[idx / 64U] |= (uint64_t{1} << (idx % 64U));
+    AstNodeExpr* eqnp = nullptr;
+    for (const auto& entry : words) {
+        const uint32_t word = entry.first;
+        uint64_t mask = entry.second;
+        if (v3Global.opt.fTriggerWords() && __builtin_popcountll(mask) > 1) {
+            AstConst* const wp = new AstConst{flp, word};
+            wp->addNext(new AstConst{flp, AstConst::Unsized64{}, mask});
+            AstCMethodHard* const testp = new AstCMethodHard{
+                flp, new AstVarRef{flp, trigVscp, VAccess::READ}, "wordAny", wp};
+            testp->dtypeSetBit();
+            testp->pure(true);
+            eqnp = eqnp ? static_cast<AstNodeExpr*>(new AstOr{flp, eqnp, testp}) : testp;
+        } else {
+            while (mask) {
+                const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(mask));
+                const uint32_t idx = word * 64U + bit;
+                AstCMethodHard* const testp = new AstCMethodHard{
+                    flp, new AstVarRef{flp, trigVscp, VAccess::READ}, "at",
+                    new AstConst{flp, idx}};
+                testp->dtypeSetBit();
+                testp->pure(true);
+                eqnp = eqnp ? static_cast<AstNodeExpr*>(new AstOr{flp, eqnp, testp}) : testp;
+                mask &= (mask - 1ULL);
+            }
+        }
+    }
+    return eqnp;
+}
+
+struct NbaEntry final {
+    AstIf* m_ifp = nullptr;
+    AstStmtExpr* m_stmtp = nullptr;
+    AstCCall* m_callp = nullptr;
+    AstCFunc* m_calleep = nullptr;
+    std::set<uint32_t> m_triggers;
+    size_t m_order = 0;
+    bool m_candidate = false;
+    bool m_pinned = true;
+    std::vector<AstVarScope*> m_reads;
+    std::vector<AstVarScope*> m_writes;
+    std::set<uint32_t> m_sinks;
+};
+
+void collectNbaEntries(AstNode* stmtsp, std::vector<NbaEntry>& entries,
+                       std::unordered_set<const AstCFunc*>& dispatchFuncs,
+                       std::unordered_set<const AstCFunc*>& leafFuncs,
+                       std::unordered_set<AstVarScope*>& pinnedVars,
+                       AstVarScope*& nbaTrigVscp) {
+    for (AstNode* nodep = stmtsp; nodep; nodep = nodep->nextp()) {
+        if (AstExecGraph* const graphp = VN_CAST(nodep, ExecGraph)) {
+            // Walk MTasks in deterministic topological order (Kahn's algorithm,
+            // tie-broken by ExecMTask::id()).
+            std::unordered_map<const ExecMTask*, uint32_t> indeg;
+            std::unordered_map<uint32_t, const ExecMTask*> byId;
+            for (const V3GraphVertex* vxp = graphp->depGraphp()->verticesBeginp(); vxp;
+                 vxp = vxp->verticesNextp()) {
+                const auto* const mtp = dynamic_cast<const ExecMTask*>(vxp);
+                if (!mtp) continue;
+                uint32_t d = 0;
+                for (const V3GraphEdge* ep = mtp->inBeginp(); ep; ep = ep->inNextp()) ++d;
+                indeg[mtp] = d;
+                byId[mtp->id()] = mtp;
+            }
+            std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<uint32_t>> ready;
+            for (const auto& kv : indeg) {
+                if (kv.second == 0) ready.push(kv.first->id());
+            }
+            while (!ready.empty()) {
+                const ExecMTask* const mtp = byId.at(ready.top());
+                ready.pop();
+                if (mtp->bodyp()) {
+                    collectNbaEntries(mtp->bodyp()->stmtsp(), entries, dispatchFuncs, leafFuncs,
+                                      pinnedVars, nbaTrigVscp);
+                }
+                for (const V3GraphEdge* ep = mtp->outBeginp(); ep; ep = ep->outNextp()) {
+                    const auto* const nxtp = dynamic_cast<const ExecMTask*>(ep->top());
+                    if (!nxtp) continue;
+                    if (--indeg[nxtp] == 0) ready.push(nxtp->id());
+                }
+            }
+            continue;
+        }
+        if (AstStmtExpr* const stmtp = VN_CAST(nodep, StmtExpr)) {
+            AstCCall* const callp = VN_CAST(stmtp->exprp(), CCall);
+            if (callp && callp->funcp() && callp->funcp()->name().rfind("_eval_nba__", 0) == 0) {
+                dispatchFuncs.insert(callp->funcp());
+                collectNbaEntries(callp->funcp()->stmtsp(), entries, dispatchFuncs, leafFuncs,
+                                  pinnedVars, nbaTrigVscp);
+                continue;
+            }
+        }
+        if (AstIf* const ifp = VN_CAST(nodep, If)) {
+            std::set<uint32_t> trigs;
+            if (!ifp->elsesp() && parseTriggerCond(ifp->condp(), nbaTrigVscp, trigs)
+                && !trigs.empty()) {
+                for (AstNode* sp = ifp->thensp(); sp; sp = sp->nextp()) {
+                    AstStmtExpr* const sep = VN_CAST(sp, StmtExpr);
+                    AstCCall* const callp = sep ? VN_CAST(sep->exprp(), CCall) : nullptr;
+                    if (callp && callp->funcp()) {
+                        NbaEntry e;
+                        e.m_ifp = ifp;
+                        e.m_stmtp = sep;
+                        e.m_callp = callp;
+                        e.m_calleep = callp->funcp();
+                        e.m_triggers = trigs;
+                        e.m_order = entries.size();
+                        leafFuncs.insert(e.m_calleep);
+                        entries.push_back(std::move(e));
+                    } else {
+                        // Inline statement inside triggered NBA block: record as non-candidate
+                        // reader/writer at trigger set `trigs` (writes pinned, reads sinked).
+                        NbaEntry e;
+                        e.m_ifp = ifp;
+                        e.m_triggers = trigs;
+                        e.m_order = entries.size();
+                        sp->foreach([&](AstVarRef* refp) {
+                            AstVarScope* const vscp = refp->varScopep();
+                            if (!vscp || vscp->varp()->isFuncLocal()) return;
+                            if (refp->access().isWriteOrRW()) pinnedVars.insert(vscp);
+                            if (refp->access().isReadOrRW()) e.m_reads.push_back(vscp);
+                        });
+                        entries.push_back(std::move(e));
+                    }
+                }
+                continue;
+            }
+        }
+        // Any other unguarded statement inside _eval_nba pins all referenced variables.
+        nodep->foreach([&](AstNodeVarRef* refp) {
+            if (refp->varScopep()) pinnedVars.insert(refp->varScopep());
+        });
+    }
+}
+
+bool setIntersects(const std::set<uint32_t>& a, const std::set<uint32_t>& b) {
+    auto ia = a.begin();
+    auto ib = b.begin();
+    while (ia != a.end() && ib != b.end()) {
+        if (*ia == *ib) return true;
+        if (*ia < *ib) ++ia;
+        else ++ib;
+    }
+    return false;
+}
+
+std::set<uint32_t> setIntersection(const std::set<uint32_t>& a, const std::set<uint32_t>& b) {
+    std::set<uint32_t> out;
+    auto ia = a.begin();
+    auto ib = b.begin();
+    while (ia != a.end() && ib != b.end()) {
+        if (*ia == *ib) {
+            out.insert(*ia);
+            ++ia;
+            ++ib;
+        } else if (*ia < *ib) {
+            ++ia;
+        } else {
+            ++ib;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+void V3ClkSkip::clkSkipSinkAll(AstNetlist* netlistp) {
+    UINFO(4, __FUNCTION__ << ": " << endl);
+
+    if (v3Global.usesTiming()) {
+        V3Stats::addStat("Optimizations, Clock skip sink unsupported model (timing)", 1);
+        return;
+    }
+
+    AstCFunc* const evalp = netlistp->evalp();
+    AstCFunc* const evalNbap = netlistp->evalNbap();
+    if (!evalp || !evalNbap) return;
+
+    AstCFunc* staticInitp = nullptr;
+    std::vector<AstCFunc*> allFuncs;
+    std::unordered_map<const AstCFunc*, size_t> callCount;
+    netlistp->foreach([&](AstCFunc* funcp) {
+        allFuncs.push_back(funcp);
+        if (funcp->name() == "_eval_static") staticInitp = funcp;
+    });
+    netlistp->foreach([&](AstCCall* callp) {
+        if (callp->funcp()) ++callCount[callp->funcp()];
+    });
+    if (!staticInitp) return;
+
+    // Locate the unique call to _eval_nba inside _eval.
+    std::vector<AstStmtExpr*> nbaCallsInEval;
+    evalp->foreach([&](AstCCall* callp) {
+        if (callp->funcp() != evalNbap) return;
+        if (AstStmtExpr* const sep = VN_CAST(callp->backp(), StmtExpr)) {
+            if (sep->exprp() == callp) nbaCallsInEval.push_back(sep);
+        }
+    });
+    if (nbaCallsInEval.size() != 1) return;
+    AstStmtExpr* const nbaCallStmtp = nbaCallsInEval.front();
+
+    // 1. Collect all NBA entries in deterministic topological order.
+    std::vector<NbaEntry> entries;
+    std::unordered_set<const AstCFunc*> nbaDispatchFuncs{evalNbap};
+    std::unordered_set<const AstCFunc*> nbaLeafFuncs;
+    std::unordered_set<AstVarScope*> pinnedVars;
+    AstVarScope* nbaTrigVscp = nullptr;
+    collectNbaEntries(evalNbap->stmtsp(), entries, nbaDispatchFuncs, nbaLeafFuncs, pinnedVars,
+                      nbaTrigVscp);
+    if (!nbaTrigVscp || entries.empty()) return;
+
+    // 2. Pin variables observed outside _eval_nba during simulation.
+    //    Ignore time-0 only / debug-dump roots (_eval_static, _eval_initial,
+    //    _eval_settle, _eval_stl, _eval_triggers__stl, _ctor_var_reset, _dump_triggers__).
+    const auto isInitOrSettleRoot = [](const AstCFunc* funcp) {
+        const string& n = funcp->name();
+        return n == "_eval_static" || n == "_eval_initial" || n == "_eval_settle"
+               || n == "_eval_stl" || n == "_eval_triggers__stl" || n == "_ctor_var_reset"
+               || n.rfind("_dump_triggers__", 0) == 0 || n.rfind("_stl_", 0) == 0
+               || n.rfind("_eval_initial__", 0) == 0 || n.rfind("_eval_static__", 0) == 0
+               || n.rfind("_ctor_var_reset", 0) == 0;
+    };
+    std::unordered_set<const AstCFunc*> nonNbaLiveFuncs;
+    std::vector<const AstCFunc*> work;
+    const auto enqueueLive = [&](const AstCFunc* fp) {
+        if (!fp || nbaDispatchFuncs.count(fp) || nbaLeafFuncs.count(fp)) return;
+        if (nonNbaLiveFuncs.insert(fp).second) work.push_back(fp);
+    };
+    enqueueLive(evalp);
+    for (const AstCFunc* const fp : allFuncs) {
+        if (fp == evalNbap || isInitOrSettleRoot(fp)) continue;
+        if (fp->entryPoint() || fp->dpiExportImpl() || fp->dpiExportDispatcher()
+            || fp->name() == "_eval_final") {
+            enqueueLive(fp);
+        }
+    }
+    while (!work.empty()) {
+        const AstCFunc* const fp = work.back();
+        work.pop_back();
+        const_cast<AstCFunc*>(fp)->foreach([&](AstNode* nodep) {
+            if (AstCCall* const callp = VN_CAST(nodep, CCall)) {
+                if (callp->funcp() && callp->funcp() != evalNbap) enqueueLive(callp->funcp());
+            } else if (AstNodeVarRef* const refp = VN_CAST(nodep, NodeVarRef)) {
+                if (refp->varScopep() && !refp->varScopep()->varp()->isFuncLocal()) {
+                    pinnedVars.insert(refp->varScopep());
+                }
+            }
+        });
+    }
+    // Pin any variable touched by opaque C text, external mutability, latches, or tracing.
+    const auto pinOpaque = [&](AstNode* nodep) {
+        nodep->foreach([&](AstNodeVarRef* refp) {
+            if (refp->varScopep()) pinnedVars.insert(refp->varScopep());
+        });
+    };
+    netlistp->foreach([&](AstCStmt* nodep) { pinOpaque(nodep); });
+    netlistp->foreach([&](AstCExpr* nodep) { pinOpaque(nodep); });
+    netlistp->foreach([&](AstUCFunc* nodep) { pinOpaque(nodep); });
+    netlistp->foreach([&](AstVarScope* vscp) {
+        const AstVar* const varp = vscp->varp();
+        if (externallyMutable(vscp) || varp->isLatched()
+            || (v3Global.opt.trace() && (vscp->isTrace() || varp->isTrace()))) {
+            pinnedVars.insert(vscp);
+        }
+    });
+
+    // 3. Classify each NBA entry and collect read/write sets.
+    std::unordered_map<AstVarScope*, std::vector<size_t>> candWriters;
+    for (size_t idx = 0; idx < entries.size(); ++idx) {
+        NbaEntry& e = entries[idx];
+        if (!e.m_calleep) continue;
+        AstCFunc* const fp = e.m_calleep;
+        bool pure = fp->name().find("_nba_comb__") != string::npos
+                    && callCount[fp] == 1 && !fp->argsp() && fp->argTypes().empty()
+                    && e.m_triggers.size() >= 2;
+        if (pure) {
+            fp->foreach([&](const AstNode* nodep) {
+                if (nodep != fp && impureForSink(nodep)) pure = false;
+            });
+        }
+        std::unordered_set<AstVarScope*> rset, wset;
+        fp->foreach([&](AstVarRef* refp) {
+            AstVarScope* const vscp = refp->varScopep();
+            if (!vscp) {
+                pure = false;
+                return;
+            }
+            if (vscp->varp()->isFuncLocal()) return;
+            if (refp->access().isWriteOrRW()) wset.insert(vscp);
+            if (refp->access().isReadOrRW()) rset.insert(vscp);
+        });
+        e.m_reads.assign(rset.begin(), rset.end());
+        e.m_writes.assign(wset.begin(), wset.end());
+        if (pure && !e.m_writes.empty()) {
+            e.m_candidate = true;
+            e.m_pinned = false;
+            for (AstVarScope* const vscp : e.m_writes) candWriters[vscp].push_back(idx);
+        } else {
+            e.m_candidate = false;
+            e.m_pinned = true;
+            for (AstVarScope* const vscp : e.m_writes) pinnedVars.insert(vscp);
+        }
+    }
+
+    // 4. Backward fixed-point over sink trigger sets.
+    std::unordered_map<AstVarScope*, std::set<uint32_t>> varSinks;
+    for (const NbaEntry& e : entries) {
+        if (!e.m_pinned) continue;
+        for (AstVarScope* const vscp : e.m_reads) {
+            varSinks[vscp].insert(e.m_triggers.begin(), e.m_triggers.end());
+        }
+    }
+
+    const auto pinEntry = [&](NbaEntry& e) {
+        if (e.m_pinned) return false;
+        e.m_pinned = true;
+        e.m_sinks.clear();
+        for (AstVarScope* const vscp : e.m_writes) pinnedVars.insert(vscp);
+        for (AstVarScope* const vscp : e.m_reads) {
+            varSinks[vscp].insert(e.m_triggers.begin(), e.m_triggers.end());
+        }
+        return true;
+    };
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t idx = 0; idx < entries.size(); ++idx) {
+            NbaEntry& e = entries[idx];
+            if (e.m_pinned) continue;
+
+            // Check whether any written variable is pinned, and union sinks of all outputs.
+            bool anyPinned = false;
+            std::set<uint32_t> outSinks;
+            for (AstVarScope* const vscp : e.m_writes) {
+                if (pinnedVars.count(vscp)) {
+                    anyPinned = true;
+                    break;
+                }
+                const auto it = varSinks.find(vscp);
+                if (it != varSinks.end()) outSinks.insert(it->second.begin(), it->second.end());
+            }
+            if (anyPinned) {
+                if (pinEntry(e)) changed = true;
+                continue;
+            }
+            if (outSinks.empty()) continue;
+
+            // Effective triggers = intersection of driving triggers and sink triggers.
+            // Ensure every deferred producer we read belongs to the exact same group:
+            // if a read var is written by another candidate whose sinks contain triggers
+            // outside `eff`, absorb them (or pin if no strict subset remains).
+            std::set<uint32_t> eff = setIntersection(e.m_triggers, outSinks);
+            // Also unify with any co-writers of our outputs or deferred producers of our inputs.
+            for (AstVarScope* const r : e.m_reads) {
+                if (pinnedVars.count(r)) continue;
+                const auto wit = candWriters.find(r);
+                if (wit == candWriters.end()) continue;
+                for (const size_t widx : wit->second) {
+                    if (widx == idx || entries[widx].m_pinned) continue;
+                    const auto& ws = entries[widx].m_sinks;
+                    if (!ws.empty()) eff.insert(ws.begin(), ws.end());
+                }
+            }
+            eff = setIntersection(e.m_triggers, eff);
+
+            if (eff.empty() || eff.size() >= e.m_triggers.size()) {
+                if (pinEntry(e)) changed = true;
+                continue;
+            }
+            if (eff != e.m_sinks) {
+                e.m_sinks = std::move(eff);
+                for (AstVarScope* const vscp : e.m_reads) {
+                    varSinks[vscp].insert(e.m_sinks.begin(), e.m_sinks.end());
+                }
+                for (AstVarScope* const vscp : e.m_writes) {
+                    varSinks[vscp].insert(e.m_sinks.begin(), e.m_sinks.end());
+                }
+                changed = true;
+            }
+        }
+        // Final consistency: any remaining unpinned entry with empty sinks (dead write)
+        // or reading a deferred producer from a mismatched group gets pinned.
+        if (!changed) {
+            for (size_t idx = 0; idx < entries.size(); ++idx) {
+                NbaEntry& e = entries[idx];
+                if (e.m_pinned) continue;
+                bool bad = e.m_sinks.empty();
+                for (AstVarScope* const vscp : e.m_writes) {
+                    if (pinnedVars.count(vscp)) bad = true;
+                    const auto wit = candWriters.find(vscp);
+                    if (wit != candWriters.end()) {
+                        for (const size_t widx : wit->second) {
+                            if (entries[widx].m_pinned || entries[widx].m_sinks != e.m_sinks) {
+                                bad = true;
+                            }
+                        }
+                    }
+                }
+                for (AstVarScope* const r : e.m_reads) {
+                    if (pinnedVars.count(r)) continue;
+                    const auto wit = candWriters.find(r);
+                    if (wit == candWriters.end()) continue;
+                    for (const size_t widx : wit->second) {
+                        if (widx == idx) continue;
+                        if (!entries[widx].m_pinned && entries[widx].m_sinks != e.m_sinks) {
+                            bad = true;
+                        }
+                    }
+                }
+                if (bad && pinEntry(e)) changed = true;
+            }
+        }
+    }
+
+    // 5. Group deferred entries by their narrowed sink trigger set K.
+    struct SinkGroup final {
+        std::set<uint32_t> m_keep;
+        std::set<uint32_t> m_dropped;
+        std::vector<size_t> m_members;
+    };
+    std::map<std::set<uint32_t>, size_t> groupIdx;
+    std::vector<SinkGroup> groups;
+    std::unordered_map<AstStmtExpr*, const std::set<uint32_t>*> narrowedStmt;
+    std::unordered_set<AstIf*> modifiedIfs;
+    size_t totalDeferred = 0;
+    size_t totalDroppedTrigs = 0;
+
+    for (size_t idx = 0; idx < entries.size(); ++idx) {
+        const NbaEntry& e = entries[idx];
+        if (e.m_pinned || e.m_sinks.empty()) continue;
+        auto it = groupIdx.find(e.m_sinks);
+        if (it == groupIdx.end()) {
+            const size_t gid = groups.size();
+            groupIdx.emplace(e.m_sinks, gid);
+            SinkGroup g;
+            g.m_keep = e.m_sinks;
+            groups.push_back(std::move(g));
+            it = groupIdx.find(e.m_sinks);
+        }
+        SinkGroup& g = groups[it->second];
+        g.m_members.push_back(idx);
+        for (const uint32_t t : e.m_triggers) {
+            if (!g.m_keep.count(t)) {
+                g.m_dropped.insert(t);
+                ++totalDroppedTrigs;
+            }
+        }
+        narrowedStmt[e.m_stmtp] = &e.m_sinks;
+        modifiedIfs.insert(e.m_ifp);
+        ++totalDeferred;
+    }
+
+    if (groups.empty()) return;
+
+    // 6. Rewrite modified AstIf blocks in _eval_nba, preserving exact order.
+    for (AstIf* const ifp : modifiedIfs) {
+        std::vector<AstNode*> body;
+        for (AstNode* sp = ifp->thensp(); sp; sp = sp->nextp()) body.push_back(sp);
+        std::vector<std::pair<const std::set<uint32_t>*, std::vector<AstNode*>>> runs;
+        for (AstNode* const sp : body) {
+            const std::set<uint32_t>* key = nullptr;
+            if (AstStmtExpr* const sep = VN_CAST(sp, StmtExpr)) {
+                const auto it = narrowedStmt.find(sep);
+                if (it != narrowedStmt.end()) key = it->second;
+            }
+            if (runs.empty() || runs.back().first != key) {
+                runs.emplace_back(key, std::vector<AstNode*>{sp});
+            } else {
+                runs.back().second.push_back(sp);
+            }
+        }
+        if (runs.size() == 1 && runs[0].first != nullptr) {
+            AstNodeExpr* const newCondp
+                = buildTriggerCond(ifp->fileline(), nbaTrigVscp, *runs[0].first);
+            ifp->condp()->replaceWith(newCondp);
+            continue;
+        }
+        AstNode* replacementp = nullptr;
+        for (auto& run : runs) {
+            AstNodeExpr* const condp
+                = run.first ? buildTriggerCond(ifp->fileline(), nbaTrigVscp, *run.first)
+                            : ifp->condp()->cloneTree(false);
+            AstIf* const newIfp = new AstIf{ifp->fileline(), condp};
+            for (AstNode* const sp : run.second) {
+                sp->unlinkFrBack();
+                newIfp->addThensp(sp);
+            }
+            addList(replacementp, newIfp);
+        }
+        ifp->replaceWith(replacementp);
+        VL_DO_DANGLING(ifp->deleteTree(), ifp);
+    }
+
+    // 7. Emit per-group dirty flag, cold pre-NBA refresh function, and _eval hooks.
+    AstScope* const scopeTopp = netlistp->topScopep()->scopep();
+    FileLine* const topFlp = netlistp->fileline();
+
+    for (size_t gid = 0; gid < groups.size(); ++gid) {
+        const SinkGroup& g = groups[gid];
+        AstVarScope* const dirtyp
+            = scopeTopp->createTemp("__Vclkskip_sink_d" + cvtToStr(gid), 1);
+        dirtyp->trace(false);
+        dirtyp->varp()->trace(false);
+        dirtyp->varp()->noSubst(true);
+        staticInitp->addInitsp(new AstAssign{topFlp, new AstVarRef{topFlp, dirtyp, VAccess::WRITE},
+                                             new AstConst{topFlp, AstConst::BitFalse{}}});
+
+        AstCFunc* const refreshp
+            = new AstCFunc{topFlp, "_clkskip_sink_refresh__" + cvtToStr(gid), scopeTopp, ""};
+        refreshp->dontCombine(true);
+        refreshp->isStatic(false);
+        refreshp->isLoose(true);
+        refreshp->slow(true);  // Cold path: only runs on wake edges after sleep
+        refreshp->isConst(false);
+        refreshp->declPrivate(true);
+        scopeTopp->addBlocksp(refreshp);
+        for (const size_t idx : g.m_members) {
+            AstCCall* const cp = new AstCCall{topFlp, entries[idx].m_calleep};
+            cp->dtypeSetVoid();
+            refreshp->addStmtsp(cp->makeStmt());
+        }
+        refreshp->addStmtsp(new AstAssign{topFlp, new AstVarRef{topFlp, dirtyp, VAccess::WRITE},
+                                          new AstConst{topFlp, AstConst::BitFalse{}}});
+
+        // Pre-NBA refresh: if (VL_UNLIKELY(dirtyp && triggered(K))) refresh();
+        AstNodeExpr* const wakeCondp = new AstLogAnd{
+            topFlp, new AstVarRef{topFlp, dirtyp, VAccess::READ},
+            buildTriggerCond(topFlp, nbaTrigVscp, g.m_keep)};
+        AstCCall* const refCallp = new AstCCall{topFlp, refreshp};
+        refCallp->dtypeSetVoid();
+        AstIf* const preIfp = new AstIf{topFlp, wakeCondp, refCallp->makeStmt()};
+        preIfp->branchPred(VBranchPred::BP_UNLIKELY);
+        nbaCallStmtp->addHereThisAsNext(preIfp);
+
+        // Post-NBA dirty mark: if (!triggered(K) && triggered(D)) dirtyp = 1;
+        AstNodeExpr* const sleepCondp = new AstLogAnd{
+            topFlp, new AstLogNot{topFlp, buildTriggerCond(topFlp, nbaTrigVscp, g.m_keep)},
+            buildTriggerCond(topFlp, nbaTrigVscp, g.m_dropped)};
+        AstIf* const postIfp = new AstIf{
+            topFlp, sleepCondp,
+            new AstAssign{topFlp, new AstVarRef{topFlp, dirtyp, VAccess::WRITE},
+                          new AstConst{topFlp, AstConst::BitTrue{}}}};
+        nbaCallStmtp->addNextHere(postIfp);
+    }
+
+    V3Stats::addStat("Optimizations, Clock skip sink groups", groups.size());
+    V3Stats::addStat("Optimizations, Clock skip sink deferred calls", totalDeferred);
+    V3Stats::addStat("Optimizations, Clock skip sink triggers dropped", totalDroppedTrigs);
+    V3Global::dumpCheckGlobalTree("clkskipsink", 0, dumpTree() >= 3);
 }

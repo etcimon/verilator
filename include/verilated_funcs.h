@@ -1748,7 +1748,7 @@ static inline void _vl_shiftl_inplace_w(int obits, WDataOutP iowp,
 // EMIT_RULE: VL_SHIFTL:  oclean=lclean; rclean==clean;
 // Important: Unlike most other funcs, the shift might well be a computed
 // expression.  Thus consider this when optimizing.  (And perhaps have 2 funcs?)
-static inline WDataOutP VL_SHIFTL_WWI(int obits, int, int, WDataOutP owp, WDataInP const lwp,
+static inline WDataOutP VL_SHIFTL_WWI(int obits, int lbits, int, WDataOutP owp, WDataInP const lwp,
                                       IData rd) VL_MT_SAFE {
     const int word_shift = VL_BITWORD_E(rd);
     const int bit_shift = VL_BITBIT_E(rd);
@@ -1758,8 +1758,20 @@ static inline WDataOutP VL_SHIFTL_WWI(int obits, int, int, WDataOutP owp, WDataI
         _vl_words_zero(owp, word_shift);
         _vl_words_copy(owp + word_shift, lwp, VL_WORDS_I(obits) - word_shift);
     } else {
-        _vl_words_zero(owp, VL_WORDS_I(obits));
-        _vl_insert_WW(owp, lwp, obits - 1, rd);
+        const int words = VL_WORDS_I(obits);
+        const int copyWords = words - word_shift;
+        // The output width is normally constant; clearing only the variable prefix
+        // can turn a few vector stores into a variable-length memset.
+        _vl_words_zero(owp, words);
+        if (copyWords > 2 && lbits >= obits && _vl_words_disjoint(owp, words, lwp, copyWords)) {
+            // Unlike a part-select assignment, a shift replaces both boundary words.
+            owp[word_shift] = lwp[0] << bit_shift;
+            _vl_words_funnel(owp + word_shift + 1, lwp, copyWords - 1, VL_EDATASIZE - bit_shift,
+                             bit_shift);
+            owp[words - 1] &= VL_MASK_E(obits);
+        } else {
+            _vl_insert_WW(owp, lwp, obits - 1, rd);
+        }
     }
     return owp;
 }

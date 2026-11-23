@@ -18,6 +18,7 @@
 #define VERILATOR_V3STDFUTURE_H_
 
 #include <functional>
+#include <type_traits>
 
 namespace vlstd {
 

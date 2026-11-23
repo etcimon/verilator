@@ -967,6 +967,7 @@ void V3Options::parseOpts(FileLine* fl, int argc, char** argv) {
             else if (item == "prio-oracc") m_fPrioOrAcc = false;
             else if (item == "wake") m_fWake = false;
             else if (item == "clock-skip") m_fClockSkip = false;
+            else if (item == "clock-skip-sink") m_fClockSkipSink = false;
             else if (item == "split-plan") m_fSplitPlan = false;
             else if (item == "dirty") m_fDirty = false;
             else if (item == "table") m_fTable = false;
@@ -1241,6 +1242,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc, char
     DECL_OPTION("-fsoa", FOnOff, &m_fSoa);
     DECL_OPTION("-fwake", FOnOff, &m_fWake);
     DECL_OPTION("-fclock-skip", FOnOff, &m_fClockSkip);
+    DECL_OPTION("-fclock-skip-sink", FOnOff, &m_fClockSkipSink);
     DECL_OPTION("-fsplit-plan", FOnOff, &m_fSplitPlan);
     DECL_OPTION("-ftable-slice", FOnOff, &m_fTableSlice);
     DECL_OPTION("-fdirty", FOnOff, &m_fDirty);
@@ -1940,6 +1942,11 @@ void V3Options::showVersion(bool verbose) {
 
 V3Options::V3Options() {
     m_impp = new V3OptionsImp;
+    m_fDfgPeepholeDisabled.emplace("pack-byte-plane");  // Opt in after profiling
+    m_fDfgPeepholeDisabled.emplace("pack-predicates");
+    m_fDfgPeepholeDisabled.emplace("pack-bitwise-mux");
+    m_fDfgPeepholeDisabled.emplace("guard-empty-mask");
+    m_fDfgPeepholeDisabled.emplace("fuse-transpose-reductions");
 
     m_traceFormat = TraceFormat::VCD;
 

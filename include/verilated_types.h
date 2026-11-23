@@ -492,25 +492,22 @@ public:
     // load and one test (V3Clock emits it under -ftrigger-words).
     bool wordAny(size_t word, Word mask) const { return (m_words[word] & mask) != 0; }
 
-    // Return true iff at least one element is set
-    bool any() const { return _vl_words_orall(ewords(), T_ewords) != 0; }
+    // Use the declared word type: BitRef writes Word, not two aliased EData halves.
+    bool any() const {
+        Word bits = 0;
+        for (const Word word : m_words) bits |= word;
+        return bits != 0;
+    }
 
     // Set all elements true in 'this' that are set in 'other'
     void set(const VlTriggerVec<T_size>& other) {
-        _vl_words_or(ewords(), ewords(), other.ewords(), T_ewords);
+        for (size_t i = 0; i < T_words; ++i) m_words[i] |= other.m_words[i];
     }
 
     // Set elements of 'this' to 'a & !b' element-wise
     void andNot(const VlTriggerVec<T_size>& a, const VlTriggerVec<T_size>& b) {
-        _vl_words_andnot(ewords(), a.ewords(), b.ewords(), T_ewords);
+        for (size_t i = 0; i < T_words; ++i) m_words[i] = a.m_words[i] & ~b.m_words[i];
     }
-
-private:
-    // The 64-bit words viewed as 32-bit words for the word-vector kernels; every
-    // operation above is bitwise, so the split is invisible.
-    static constexpr int T_ewords = static_cast<int>(T_words * (WORD_BITS / 32));
-    EData* ewords() { return reinterpret_cast<EData*>(m_words.data()); }
-    const EData* ewords() const { return reinterpret_cast<const EData*>(m_words.data()); }
 };
 
 //===================================================================
@@ -1491,6 +1488,7 @@ class VlDeleter final {
     // MEMBERS
     // Queue of new objects that should be deleted
     std::vector<VlDeletable*> m_newGarbage VL_GUARDED_BY(m_mutex);
+    std::atomic<bool> m_pending{false};  // Inspect without touching the protected queue
     // Queue of objects currently being deleted (only for deleteAll())
     std::vector<VlDeletable*> m_toDelete VL_GUARDED_BY(m_deleteMutex);
     mutable VerilatedMutex m_mutex;  // Mutex protecting the 'new garbage' queue
@@ -1510,6 +1508,7 @@ public:
     void put(VlDeletable* const objp) VL_MT_SAFE {
         const VerilatedLockGuard lock{m_mutex};
         m_newGarbage.push_back(objp);
+        m_pending.store(true, std::memory_order_release);
     }
 
     // Deletes all queued garbage objects.

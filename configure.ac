@@ -541,9 +541,14 @@ if test "$_my_result" = "no" ; then
    _MY_CXX_CHECK_CXX_VER()
    AC_MSG_RESULT($_my_result)
 else
-   # CFG_CXXFLAGS_STD is also propagated to include/verilated.mk.in
-   # make sure we use the same std flag while compiling verilator and verilated design
-   CFG_CXXFLAGS_STD=""
+   # AC_PROG_CXX's C++11 feature probe can pin an older -std (e.g. -std=gnu++11)
+   # into $CXX when the compiler default rejects C++11-test constructs that
+   # were removed in later standards.  The sources require the newest detected
+   # standard (C++14 type traits), so append it to CXXFLAGS: the later -std
+   # wins over the pinned one.  Keep CFG_CXXFLAGS_STD propagated to
+   # include/verilated.mk.in so the verilated model uses the same std.
+   CXXFLAGS="$CXXFLAGS $CFG_CXXFLAGS_STD"
+   CFG_CXX_FLAGS_CMAKE="$CFG_CXX_FLAGS_CMAKE $CFG_CXXFLAGS_STD"
 fi
 if test "$_my_result" = "no" ; then
    AC_MSG_NOTICE([[]])

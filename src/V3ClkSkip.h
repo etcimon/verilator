@@ -29,6 +29,9 @@ public:
     // After scheduling, guard combo that still runs when an instance's own
     // inputs did not change. Clocked regions stay on their edge trigger.
     static void clkSkipAll(AstNetlist* nodep);
+    // Defer pure multi-domain NBA combo whose transitive sinks are strictly
+    // narrower than its driving trigger set (e.g. gated-clock next-state).
+    static void clkSkipSinkAll(AstNetlist* nodep);
 };
 
 #endif

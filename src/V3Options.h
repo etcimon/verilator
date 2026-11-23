@@ -391,6 +391,7 @@ private:
     // (+33 % instructions per cycle). -ftable-slice tables a wide decoder per output
     // support mask; measured +2 % instructions per cycle on CVA6.
     bool m_fClockSkip = false;  // -fclock-skip: skip stable instance combo (opt-in)
+    bool m_fClockSkipSink = false;  // -fclock-skip-sink: defer sink-closed NBA combo across gated clocks (opt-in)
     bool m_fSplitPlan = false;  // -fsplit-plan: auto split_var on combo cycles (opt-in)
     bool m_fTableSlice = false;  // -ftable-slice: slice wide tables by output support (opt-in)
     bool m_fDirty = false;  // -fdirty: dirty-bit hybrid triggers (opt-in, see above)
@@ -669,6 +670,7 @@ public:
     bool fSoa() const { return m_fSoa; }
     bool fWake() const { return m_fWake; }
     bool fClockSkip() const { return m_fClockSkip; }
+    bool fClockSkipSink() const { return m_fClockSkipSink; }
     bool fSplitPlan() const { return m_fSplitPlan; }
     bool fDirty() const { return m_fDirty; }
     bool fFieldSplit() const { return m_fFieldSplit; }

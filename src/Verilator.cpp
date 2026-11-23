@@ -467,6 +467,10 @@ static void process() {
         // clock gate has stopped that instance's edge trigger. Skip it when
         // the nets it reads are unchanged.
         if (v3Global.opt.fClockSkip()) V3ClkSkip::clkSkipAll(v3Global.rootp());
+        // Multi-domain NBA combo whose outputs only feed a strictly narrower
+        // sink trigger set (e.g. a clock-gated subsystem) can defer until one
+        // of its sink triggers fires, refreshing lazily before NBA. MT-safe.
+        if (v3Global.opt.fClockSkipSink()) V3ClkSkip::clkSkipSinkAll(v3Global.rootp());
 
         // Wide hybrid cuts that could not be split still change-detect by a
         // full vector compare. Arm the dirty bits now that every store exists

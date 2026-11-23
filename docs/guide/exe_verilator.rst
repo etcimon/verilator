@@ -405,6 +405,78 @@ Summary:
    Rarely needed - for developer use.  Set internal V3Graph dumping level
    globally to the specified value.
 
+.. option:: --dumpi-sentinel <level>
+
+   A nonzero level writes diagnostic JSON in the model output directory.
+   Each enabled DFG optimization phase records a per-module input snapshot
+   (operand order, slices, variable drivers, references and source locations).
+   This works with a single simulation thread. Thread partitioning additionally
+   records task order, profile keys, graph predecessors and retained waits.
+   These are separate ID spaces; neither a DFG vertex count nor a task's
+   estimated cost measures elapsed time. No optimization or runtime tracing is
+   enabled by this option. Dumps can be large and contain design names.
+
+.. option:: -fdfg-peephole-pack-byte-plane
+
+   Opt in to packing the same bit from each byte of a 64-bit packed value
+   into one byte (in ascending byte order). Uses unsigned masking and a
+   constant multiplication; no host instruction-set extension is required.
+   The default is off. Requires the DFG optimizer and peepholes. Use
+   ``--stats`` to count applications; ``--dumpi-sentinel`` is independent.
+
+.. option:: -fdfg-peephole-pack-predicates
+
+   Opt in to combining 8 to 64 adjacent one-bit predicates of the form
+   ``valid & ~(veto & gate)`` into a packed expression when the gate is
+   shared and the veto bits form an ascending packed slice. The order of
+   the validity bits is preserved. Applies only in acyclic DFG components
+   after X handling; requires DFG and peephole optimization. Off by default.
+   ``--stats`` reports the number of packed groups, not the number of bits.
+
+.. option:: -fdfg-peephole-pack-bitwise-mux
+
+   Opt in to combining 8 to 64 adjacent one-bit 2-way mux lanes of the form
+   ``(sel & a[i]) | (~sel & b[i])`` or ``sel ? a[i] : b[i]`` into a single
+   packed conditional when ``sel`` is shared and both data slices are
+   ascending contiguous slices of packed variables. Applies only in acyclic
+   DFG components after X handling; off by default. ``--stats`` reports
+   ``packed bitwise muxes``.
+
+.. option:: -fclock-skip-sink
+
+   Opt in to sink-domain deferral of pure multi-domain NBA combinational
+   functions whose transitive consumers only depend on a strict subset of
+   their driving triggers (for example, a clock-gated core's next-state
+   combinational logic tainted by an always-on global clock). Works in both
+   single-threaded and multi-threaded (``--threads N``) builds: narrows the
+   NBA trigger guard to the sink triggers, marks a per-group dirty flag when
+   dropped triggers fire without the sink triggers, and runs a cold pre-NBA
+   refresh once on the wake edge before sequential flops sample. Off by
+   default. ``--stats`` reports ``Clock skip sink groups`` and
+   ``Clock skip sink deferred calls``.
+
+.. option:: -fdfg-peephole-guard-empty-mask
+
+   Opt in to a zero-mask fast path for groups of masked OR reductions.
+   The packed result must consist of 8 to 64 single-bit lanes; each lane
+   must require its corresponding bit of the same packed mask to be set.
+   When that mask is zero, the entire result is zero. Otherwise the
+   original reductions are evaluated. This does not remove or reschedule
+   the producers of the data being reduced. Requires DFG peepholes after
+   X handling; off by default. Check the ``empty mask guards`` statistic
+   and measure the actual mask distribution before enabling it.
+
+.. option:: -fdfg-peephole-fuse-transpose-reductions
+
+   Opt in to fusing reductions of all columns of a private square packed
+   transpose (side 8 through 64). Each column must be ANDed with the same
+   packed mask and OR-reduced. Verilator can instead mask contiguous input
+   rows and OR the rows together; an empty mask gives zero. The matrix
+   source must be an undriven input port of the component, and the
+   intermediate must have no other readers, writers or visibility requirements.
+   This applies before scheduling, only in an acyclic DFG after X handling.
+   Off by default. Use ``--stats`` to count ``fused transposes``.
+
 .. option:: --dumpi-tree <level>
 
    Rarely needed - for developer use.  Set internal Ast dumping level

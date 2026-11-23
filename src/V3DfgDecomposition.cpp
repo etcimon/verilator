@@ -25,6 +25,7 @@
 #include "V3File.h"
 
 #include <deque>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 

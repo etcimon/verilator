@@ -3183,11 +3183,13 @@ void VerilatedAssertOneThread::fatal_different() VL_MT_SAFE {
 // VlDeleter:: Methods
 
 void VlDeleter::deleteAll() {
+    if (!m_pending.load(std::memory_order_acquire)) return;
     while (true) {
         VerilatedLockGuard lock{m_mutex};
         if (m_newGarbage.empty()) break;
         VerilatedLockGuard deleteLock{m_deleteMutex};
         std::swap(m_newGarbage, m_toDelete);
+        m_pending.store(false, std::memory_order_relaxed);  // Serialized with put() by m_mutex
         lock.unlock();  // So destructors can enqueue new objects
         for (VlDeletable* const objp : m_toDelete) delete objp;
         m_toDelete.clear();
