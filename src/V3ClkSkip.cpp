@@ -628,6 +628,10 @@ bool parseTriggerCond(AstNodeExpr* condp, AstVarScope*& trigVscp, std::set<uint3
         return parseTriggerCond(orp->lhsp(), trigVscp, bits)
                && parseTriggerCond(orp->rhsp(), trigVscp, bits);
     }
+    if (AstLogOr* const lorp = VN_CAST(condp, LogOr)) {
+        return parseTriggerCond(lorp->lhsp(), trigVscp, bits)
+               && parseTriggerCond(lorp->rhsp(), trigVscp, bits);
+    }
     AstCMethodHard* const callp = VN_CAST(condp, CMethodHard);
     if (!callp) return false;
     AstVarRef* const refp = VN_CAST(callp->fromp(), VarRef);
